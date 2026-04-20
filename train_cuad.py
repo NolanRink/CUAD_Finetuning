@@ -73,6 +73,7 @@ FABRIC_FIRST_RUN_GUIDE = """FABRIC first run:
      export HF_HUB_CACHE=/mnt/project/cache/hf/hub
      export HF_XET_CACHE=/mnt/project/cache/hf/xet
      export HF_DATASETS_CACHE=/mnt/project/cache/hf/datasets
+     export HF_HUB_DISABLE_XET=1
      echo $HF_HOME
      echo $HF_HUB_CACHE
      echo $HF_DATASETS_CACHE
@@ -183,6 +184,7 @@ def configure_hf_cache(cache_root: str) -> None:
     os.environ["HF_HUB_CACHE"] = str(Path(cache_root) / "hub")
     os.environ["HF_XET_CACHE"] = str(Path(cache_root) / "xet")
     os.environ["HF_DATASETS_CACHE"] = str(Path(cache_root) / "datasets")
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     os.environ.pop("TRANSFORMERS_CACHE", None)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 

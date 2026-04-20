@@ -3,6 +3,8 @@
 #   python -m pip install --no-cache-dir torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 # Do not install torchvision or torchaudio for this repo; they are unused here and can
 # create avoidable torch-version conflicts on fresh FABRIC nodes.
+# On FABRIC, also export HF_HUB_DISABLE_XET=1 before model downloads if Xet-backed
+# transfers stall on the mounted or local cache.
 # For local CPU-only development, install torch from the PyTorch selector or PyPI before
 # using train/evaluate.
 
