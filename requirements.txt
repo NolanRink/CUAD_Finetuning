@@ -2,7 +2,7 @@
 # Keep this file conservative; add Linux-only acceleration packages later if needed.
 
 torch
-transformers
+transformers<5
 datasets
 accelerate
 peft

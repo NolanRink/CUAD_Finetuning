@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import random
@@ -1139,6 +1140,50 @@ def load_model_for_inference(
     return model, tokenizer, model_source
 
 
+def build_training_arguments(
+    TrainingArguments: Any,
+    checkpoint_dir: Path,
+    args: argparse.Namespace,
+    *,
+    has_validation: bool,
+    use_bf16: bool,
+    use_fp16: bool,
+    dataloader_pin_memory: bool,
+) -> Any:
+    """Adapt Trainer args across transformers releases with small API drift."""
+    supported_args = set(inspect.signature(TrainingArguments.__init__).parameters)
+    training_kwargs: dict[str, Any] = {
+        "output_dir": str(checkpoint_dir),
+        "overwrite_output_dir": True,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "per_device_eval_batch_size": args.per_device_eval_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "num_train_epochs": args.num_train_epochs,
+        "max_steps": args.max_train_steps,
+        "logging_steps": 1,
+        "eval_steps": 1 if has_validation else None,
+        "save_strategy": "no",
+        "report_to": [],
+        "remove_unused_columns": False,
+        "label_names": ["labels"],
+        "bf16": use_bf16,
+        "fp16": use_fp16,
+        "dataloader_pin_memory": dataloader_pin_memory,
+    }
+    if "evaluation_strategy" in supported_args:
+        training_kwargs["evaluation_strategy"] = "steps" if has_validation else "no"
+    elif "eval_strategy" in supported_args:
+        training_kwargs["eval_strategy"] = "steps" if has_validation else "no"
+
+    compatible_kwargs = {
+        key: value
+        for key, value in training_kwargs.items()
+        if key in supported_args and value is not None
+    }
+    return TrainingArguments(**compatible_kwargs)
+
+
 def generate_prediction(
     model: Any,
     tokenizer: Any,
@@ -1721,24 +1766,14 @@ def run_train(args: argparse.Namespace) -> int:
 
     use_bf16 = torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
     use_fp16 = torch.cuda.is_available() and not use_bf16
-    training_args = TrainingArguments(
-        output_dir=str(checkpoint_dir),
-        overwrite_output_dir=True,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        num_train_epochs=args.num_train_epochs,
-        max_steps=max_train_steps,
-        logging_steps=1,
-        evaluation_strategy="steps" if validation_features else "no",
-        eval_steps=1 if validation_features else None,
-        save_strategy="no",
-        report_to=[],
-        remove_unused_columns=False,
-        label_names=["labels"],
-        bf16=use_bf16,
-        fp16=use_fp16,
+    args.max_train_steps = max_train_steps
+    training_args = build_training_arguments(
+        TrainingArguments,
+        checkpoint_dir,
+        args,
+        has_validation=bool(validation_features),
+        use_bf16=use_bf16,
+        use_fp16=use_fp16,
         dataloader_pin_memory=torch.cuda.is_available(),
     )
     trainer = Trainer(
