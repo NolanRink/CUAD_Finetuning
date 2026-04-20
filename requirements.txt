@@ -1,0 +1,19 @@
+# Minimal v1 stack for local notebook bootstrap and later FABRIC single-GPU work.
+# Keep this file conservative; add Linux-only acceleration packages later if needed.
+
+torch
+transformers
+datasets
+accelerate
+peft
+evaluate
+safetensors
+sentencepiece
+
+numpy
+pandas
+scikit-learn
+matplotlib
+
+jupyter
+ipykernel

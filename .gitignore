@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Local artifacts and caches
+data/
+artifacts/
+checkpoints/
+.cache/
+cache/
+hf_cache/
