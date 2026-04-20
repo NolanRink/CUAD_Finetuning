@@ -59,6 +59,35 @@ CATEGORY_PATTERN = re.compile(r'related to "(?P<category>.+?)"')
 JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 WHITESPACE_PATTERN = re.compile(r"\s+")
 
+FABRIC_FIRST_RUN_GUIDE = """FABRIC first run:
+  1. Verify mounted project storage before creating the environment:
+     ls -ld /mnt/project
+     mkdir -p /mnt/project/data /mnt/project/checkpoints /mnt/project/cache/hf /mnt/project/artifacts
+     ls -ld /mnt/project/data /mnt/project/checkpoints /mnt/project/cache/hf /mnt/project/artifacts
+     test -w /mnt/project/data && test -w /mnt/project/checkpoints && test -w /mnt/project/cache/hf && test -w /mnt/project/artifacts
+
+  2. Set and verify Hugging Face cache paths:
+     export HF_HOME=/mnt/project/cache/hf
+     export TRANSFORMERS_CACHE=/mnt/project/cache/hf
+     echo $HF_HOME
+     echo $TRANSFORMERS_CACHE
+
+  3. Verify GPU, CUDA, and free space:
+     nvidia-smi
+     python -c "import shutil; print('free_gb=', round(shutil.disk_usage('/mnt/project').free / (1024 ** 3), 2))"
+
+  4. Create the environment and install dependencies:
+     python -m venv .venv
+     source .venv/bin/activate
+     pip install -r requirements.txt
+     python -c "import torch; print('cuda_available=', torch.cuda.is_available()); print('device=', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"
+
+  5. Run the first smoke path with mounted storage defaults:
+     python train_cuad.py preprocess --smoke --output-name cuad_preprocessed_smoke
+     python train_cuad.py train --preprocessed-name cuad_preprocessed_smoke --smoke --max-train-steps 2 --summary-name cuad_train_summary_smoke.json
+     python train_cuad.py evaluate --preprocessed-name cuad_preprocessed_smoke --smoke --checkpoint-name cuad_structured_generation --prediction-name cuad_eval_predictions_smoke.jsonl --sample-prediction-name cuad_eval_prediction_samples_smoke.jsonl --metrics-name cuad_eval_metrics_smoke.json
+"""
+
 
 class ListDataset:
     def __init__(self, features: list[dict[str, Any]]) -> None:
@@ -101,12 +130,25 @@ def ensure_directory(path: Path) -> Path:
     return path
 
 
+def should_preserve_fabric_default_root(
+    configured_value: str,
+    default_value: str,
+) -> bool:
+    return (
+        configured_value == default_value
+        and default_value.startswith("/mnt/project/")
+        and Path("/mnt/project").exists()
+    )
+
+
 def resolve_default_root(
     configured_value: str,
     default_value: str,
     local_fallback: Path,
 ) -> str:
     configured_path = Path(configured_value)
+    if should_preserve_fabric_default_root(configured_value, default_value):
+        return str(configured_path)
     if configured_value == default_value and not configured_path.exists():
         return str(local_fallback)
     return str(configured_path)
@@ -130,9 +172,25 @@ def resolve_roots(args: argparse.Namespace) -> dict[str, str]:
 
 
 def configure_hf_cache(cache_root: str) -> None:
-    os.environ.setdefault("HF_HOME", cache_root)
-    os.environ.setdefault("TRANSFORMERS_CACHE", cache_root)
+    os.environ["HF_HOME"] = cache_root
+    os.environ["TRANSFORMERS_CACHE"] = cache_root
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def ensure_runtime_roots(
+    roots: dict[str, str],
+) -> None:
+    for name, root_value in roots.items():
+        root_path = Path(root_value)
+        if root_value.startswith("/mnt/project/"):
+            if not Path("/mnt/project").exists():
+                raise FileNotFoundError(
+                    f"Expected mounted FABRIC project storage at /mnt/project before using {name} "
+                    f"root {root_path}. Mount project storage first or override the path explicitly."
+                )
+            ensure_directory(root_path)
+        else:
+            ensure_directory(root_path)
 
 
 def resolve_model_name(args: argparse.Namespace) -> str:
@@ -155,6 +213,13 @@ def normalize_answer_texts(answer_texts: list[str]) -> str | None:
     if not deduped:
         return None
     return "; ".join(deduped)
+
+
+def build_evidence_text(evidence_spans: list[str]) -> str | None:
+    deduped = normalize_answer_texts(evidence_spans)
+    if deduped is None:
+        return None
+    return deduped
 
 
 def normalize_metric_text(value: Any) -> str | None:
@@ -441,10 +506,18 @@ def build_chunk_annotations_for_contract(
         positive_rows: list[dict[str, Any]] = []
         negative_candidates: list[dict[str, Any]] = []
         for chunk in chunks:
-            visible_answers = [
-                span["text"]
+            visible_span_records = [
+                span
                 for span in annotation["answer_spans"]
                 if chunk["chunk_char_start"] <= span["start"] and span["end"] <= chunk["chunk_char_end"]
+            ]
+            visible_answers = [
+                span["text"]
+                for span in visible_span_records
+            ]
+            visible_evidence_spans = [
+                contract["contract_text"][span["start"] : span["end"]]
+                for span in visible_span_records
             ]
             if not visible_answers and annotation["answer_texts"]:
                 visible_answers = [
@@ -452,9 +525,11 @@ def build_chunk_annotations_for_contract(
                     for answer_text in annotation["answer_texts"]
                     if answer_text.strip() and answer_text.strip() in chunk["chunk_text"]
                 ]
+                visible_evidence_spans = visible_answers
 
             if visible_answers:
                 normalized_answer = normalize_answer_texts(visible_answers)
+                evidence_text = build_evidence_text(visible_evidence_spans)
                 positive_rows.append(
                     {
                         **chunk,
@@ -464,7 +539,7 @@ def build_chunk_annotations_for_contract(
                         "category": annotation["category"],
                         "found": True,
                         "normalized_answer": normalized_answer,
-                        "evidence_text": normalized_answer,
+                        "evidence_text": evidence_text,
                         "num_visible_answers": len(visible_answers),
                     }
                 )
@@ -648,6 +723,16 @@ def write_jsonl(records: list[dict[str, Any]], filepath: Path) -> None:
 
 def write_json(payload: dict[str, Any], filepath: Path) -> None:
     filepath.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def write_run_summary(
+    artifact_root: Path,
+    filename: str,
+    payload: dict[str, Any],
+) -> Path:
+    summary_path = artifact_root / filename
+    write_json(payload, summary_path)
+    return summary_path
 
 
 def load_jsonl(filepath: Path) -> list[dict[str, Any]]:
@@ -842,14 +927,27 @@ def build_generation_features(
     return features
 
 
-def import_training_stack() -> tuple[Any, Any, Any, Any]:
+def import_training_stack(
+    *,
+    include_trainer: bool,
+) -> tuple[Any, Any, Any | None, Any | None]:
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+        from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise RuntimeError(
             "Training requires torch and transformers from requirements.txt."
         ) from exc
+
+    Trainer = None
+    TrainingArguments = None
+    if include_trainer:
+        try:
+            from transformers import Trainer, TrainingArguments
+        except ImportError as exc:
+            raise RuntimeError(
+                "Training requires Trainer and TrainingArguments from transformers."
+            ) from exc
     return torch, AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 
 
@@ -900,7 +998,9 @@ def load_model_for_training(
     lora_alpha: int,
     lora_dropout: float,
 ) -> tuple[Any, Any, dict[str, Any]]:
-    torch, AutoModelForCausalLM, AutoTokenizer, _, _ = import_training_stack()
+    torch, AutoModelForCausalLM, AutoTokenizer, _, _ = import_training_stack(
+        include_trainer=False,
+    )
     model_kwargs: dict[str, Any] = {"cache_dir": cache_root}
     torch_dtype = choose_torch_dtype(torch)
     if torch_dtype is not None:
@@ -936,16 +1036,60 @@ def load_model_for_training(
     return model, tokenizer, lora_summary
 
 
+def checkpoint_contains_model_artifacts(checkpoint_path: Path) -> bool:
+    has_adapter_config = (checkpoint_path / "adapter_config.json").exists()
+    has_adapter_weights = any(
+        (checkpoint_path / filename).exists()
+        for filename in ("adapter_model.safetensors", "adapter_model.bin")
+    )
+    if has_adapter_config and has_adapter_weights:
+        return True
+
+    has_model_config = (checkpoint_path / "config.json").exists()
+    has_model_weights = any(
+        (checkpoint_path / filename).exists()
+        for filename in ("model.safetensors", "pytorch_model.bin")
+    )
+    has_tokenizer_config = (checkpoint_path / "tokenizer_config.json").exists()
+    has_tokenizer_files = any(
+        (checkpoint_path / filename).exists()
+        for filename in (
+            "tokenizer.json",
+            "tokenizer.model",
+            "sentencepiece.bpe.model",
+            "vocab.json",
+        )
+    )
+    return (
+        has_model_config
+        and has_model_weights
+        and has_tokenizer_config
+        and has_tokenizer_files
+    )
+
+
 def resolve_checkpoint_source(
     args: argparse.Namespace,
     roots: dict[str, str],
-) -> Path | None:
+) -> Path:
     if args.checkpoint_path:
-        return Path(args.checkpoint_path)
+        checkpoint_path = Path(args.checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Explicit checkpoint path does not exist: {checkpoint_path}"
+            )
+        if not checkpoint_contains_model_artifacts(checkpoint_path):
+            raise FileNotFoundError(
+                f"Checkpoint path exists but does not contain model artifacts: {checkpoint_path}"
+            )
+        return checkpoint_path
     candidate = Path(roots["checkpoint_root"]) / args.checkpoint_name
-    if candidate.exists():
+    if candidate.exists() and checkpoint_contains_model_artifacts(candidate):
         return candidate
-    return None
+    raise FileNotFoundError(
+        f"No checkpoint found at {candidate}. Run training first, pass --checkpoint-path, "
+        "or use --dry-run for reference-only evaluation."
+    )
 
 
 def load_model_for_inference(
@@ -953,7 +1097,9 @@ def load_model_for_inference(
     checkpoint_source: Path | None,
     cache_root: str,
 ) -> tuple[Any, Any, str]:
-    torch, AutoModelForCausalLM, AutoTokenizer, _, _ = import_training_stack()
+    torch, AutoModelForCausalLM, AutoTokenizer, _, _ = import_training_stack(
+        include_trainer=False,
+    )
     model_kwargs: dict[str, Any] = {"cache_dir": cache_root}
     torch_dtype = choose_torch_dtype(torch)
     if torch_dtype is not None:
@@ -1148,7 +1294,9 @@ def add_chunking_args(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Runnable CUAD preprocessing, smoke-training, and evaluation CLI."
+        description="Runnable CUAD preprocessing, smoke-training, and evaluation CLI.",
+        epilog=FABRIC_FIRST_RUN_GUIDE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1324,6 +1472,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate data and print a training summary without downloading or training a model.",
     )
     train_parser.add_argument(
+        "--summary-name",
+        default="cuad_train_summary.json",
+        help="Training summary artifact filename under artifact-root.",
+    )
+    train_parser.add_argument(
         "--split-seed",
         type=int,
         default=DEFAULT_SPLIT_SEED,
@@ -1419,6 +1572,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_preprocess(args: argparse.Namespace) -> int:
     roots = resolve_roots(args)
+    ensure_runtime_roots(roots)
     data_root = ensure_directory(Path(roots["data_root"]))
     dataset_root = (
         Path(args.dataset_path)
@@ -1487,10 +1641,12 @@ def run_preprocess(args: argparse.Namespace) -> int:
 
 def run_train(args: argparse.Namespace) -> int:
     roots = resolve_roots(args)
+    ensure_runtime_roots(roots)
     model_name = resolve_model_name(args)
     preprocessed_dir = Path(roots["data_root"]) / args.preprocessed_name
     train_records = load_preprocessed_split(preprocessed_dir, args.train_split)
     validation_records = load_preprocessed_split(preprocessed_dir, args.validation_split)
+    artifact_root = ensure_directory(Path(roots["artifact_root"]))
 
     if args.smoke:
         train_records = sample_records(
@@ -1525,12 +1681,16 @@ def run_train(args: argparse.Namespace) -> int:
         ),
     }
     if args.dry_run:
+        summary["summary_artifact"] = str(artifact_root / args.summary_name)
+        write_run_summary(artifact_root, args.summary_name, summary)
         print("Training dry run complete.")
         print(json.dumps(summary, indent=2))
         return 0
 
     configure_hf_cache(roots["cache_root"])
-    torch, _, _, Trainer, TrainingArguments = import_training_stack()
+    torch, _, _, Trainer, TrainingArguments = import_training_stack(
+        include_trainer=True,
+    )
     checkpoint_dir = ensure_directory(Path(roots["checkpoint_root"]) / args.output_name)
     model, tokenizer, lora_summary = load_model_for_training(
         model_name=model_name,
@@ -1603,6 +1763,8 @@ def run_train(args: argparse.Namespace) -> int:
             "validation_feature_count": len(validation_features),
         }
     )
+    summary["summary_artifact"] = str(artifact_root / args.summary_name)
+    write_run_summary(artifact_root, args.summary_name, summary)
     print("Training complete.")
     print(json.dumps(summary, indent=2))
     return 0
@@ -1610,6 +1772,7 @@ def run_train(args: argparse.Namespace) -> int:
 
 def run_evaluate(args: argparse.Namespace) -> int:
     roots = resolve_roots(args)
+    ensure_runtime_roots(roots)
     model_name = resolve_model_name(args)
     preprocessed_dir = Path(roots["data_root"]) / args.preprocessed_name
     records = load_preprocessed_split(preprocessed_dir, args.split)
