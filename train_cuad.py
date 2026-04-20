@@ -55,6 +55,7 @@ DEFAULT_SMOKE_MAX_TRAIN_RECORDS = 32
 DEFAULT_SMOKE_MAX_VALIDATION_RECORDS = 16
 DEFAULT_SMOKE_MAX_EVAL_RECORDS = 16
 DEFAULT_SMOKE_MAX_STEPS = 2
+MODEL_MAX_LENGTH_SENTINEL = 1_000_000
 
 CATEGORY_PATTERN = re.compile(r'related to "(?P<category>.+?)"')
 JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
@@ -69,9 +70,12 @@ FABRIC_FIRST_RUN_GUIDE = """FABRIC first run:
 
   2. Set and verify Hugging Face cache paths:
      export HF_HOME=/mnt/project/cache/hf
-     export TRANSFORMERS_CACHE=/mnt/project/cache/hf
+     export HF_HUB_CACHE=/mnt/project/cache/hf/hub
+     export HF_XET_CACHE=/mnt/project/cache/hf/xet
+     export HF_DATASETS_CACHE=/mnt/project/cache/hf/datasets
      echo $HF_HOME
-     echo $TRANSFORMERS_CACHE
+     echo $HF_HUB_CACHE
+     echo $HF_DATASETS_CACHE
 
   3. Verify GPU, CUDA, and free space:
      nvidia-smi
@@ -80,13 +84,15 @@ FABRIC_FIRST_RUN_GUIDE = """FABRIC first run:
   4. Create the environment and install dependencies:
      python -m venv .venv
      source .venv/bin/activate
-     pip install -r requirements.txt
-     python -c "import torch; print('cuda_available=', torch.cuda.is_available()); print('device=', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"
+     python -m pip install --upgrade pip setuptools wheel
+     python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+     python -m pip install -r requirements.txt
+     python -c "import torch; print('torch=', torch.__version__); print('torch_cuda=', torch.version.cuda); print('cuda_available=', torch.cuda.is_available()); print('device=', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"
 
   5. Run the first smoke path with mounted storage defaults:
      python train_cuad.py preprocess --smoke --output-name cuad_preprocessed_smoke
      python train_cuad.py train --preprocessed-name cuad_preprocessed_smoke --smoke --max-train-steps 2 --summary-name cuad_train_summary_smoke.json
-     python train_cuad.py evaluate --preprocessed-name cuad_preprocessed_smoke --smoke --checkpoint-name cuad_structured_generation --prediction-name cuad_eval_predictions_smoke.jsonl --sample-prediction-name cuad_eval_prediction_samples_smoke.jsonl --metrics-name cuad_eval_metrics_smoke.json
+     python train_cuad.py evaluate --preprocessed-name cuad_preprocessed_smoke --smoke --checkpoint-name cuad_structured_generation --prediction-name cuad_eval_predictions_smoke.jsonl --sample-prediction-name cuad_eval_prediction_samples_smoke.jsonl --metrics-name cuad_eval_metrics_smoke.json --max-new-tokens 192
 """
 
 
@@ -174,7 +180,10 @@ def resolve_roots(args: argparse.Namespace) -> dict[str, str]:
 
 def configure_hf_cache(cache_root: str) -> None:
     os.environ["HF_HOME"] = cache_root
-    os.environ["TRANSFORMERS_CACHE"] = cache_root
+    os.environ["HF_HUB_CACHE"] = str(Path(cache_root) / "hub")
+    os.environ["HF_XET_CACHE"] = str(Path(cache_root) / "xet")
+    os.environ["HF_DATASETS_CACHE"] = str(Path(cache_root) / "datasets")
+    os.environ.pop("TRANSFORMERS_CACHE", None)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
@@ -895,6 +904,7 @@ def build_generation_features(
     tokenizer: Any,
     max_source_length: int,
     max_target_length: int,
+    model_context_window: int,
 ) -> list[dict[str, Any]]:
     eos_text = tokenizer.eos_token or ""
     features: list[dict[str, Any]] = []
@@ -916,7 +926,17 @@ def build_generation_features(
         )["input_ids"]
         if not target_ids:
             raise ValueError("Tokenized target is empty; increase max_target_length.")
+        if len(target_ids) >= model_context_window:
+            target_ids = target_ids[: model_context_window - 1]
 
+        max_prompt_tokens = model_context_window - len(target_ids)
+        if max_prompt_tokens <= 0:
+            raise ValueError(
+                "Target token budget exhausts the model context window after truncation. "
+                "Reduce max_target_length or choose a larger-context model."
+            )
+        if len(prompt_ids) > max_prompt_tokens:
+            prompt_ids = prompt_ids[:max_prompt_tokens]
         input_ids = prompt_ids + target_ids
         features.append(
             {
@@ -958,6 +978,111 @@ def choose_torch_dtype(torch: Any) -> Any | None:
     if getattr(torch.cuda, "is_bf16_supported", lambda: False)():
         return torch.bfloat16
     return torch.float16
+
+
+def collect_model_length_candidates(tokenizer: Any, model: Any | None = None) -> list[int]:
+    candidates: list[int] = []
+    tokenizer_candidate = getattr(tokenizer, "model_max_length", None)
+    if isinstance(tokenizer_candidate, int) and 0 < tokenizer_candidate < MODEL_MAX_LENGTH_SENTINEL:
+        candidates.append(tokenizer_candidate)
+
+    config_candidates = (
+        "max_position_embeddings",
+        "n_positions",
+        "max_seq_len",
+        "max_sequence_length",
+        "seq_length",
+        "model_max_length",
+    )
+    pending_configs: list[Any] = []
+    if model is not None and getattr(model, "config", None) is not None:
+        pending_configs.append(model.config)
+
+    visited: set[int] = set()
+    while pending_configs:
+        config = pending_configs.pop()
+        config_id = id(config)
+        if config_id in visited:
+            continue
+        visited.add(config_id)
+
+        for attribute in config_candidates:
+            candidate = getattr(config, attribute, None)
+            if isinstance(candidate, int) and 0 < candidate < MODEL_MAX_LENGTH_SENTINEL:
+                candidates.append(candidate)
+
+        nested_config = getattr(config, "text_config", None)
+        if nested_config is not None:
+            pending_configs.append(nested_config)
+
+    deduped = sorted(set(candidates))
+    if not deduped:
+        raise RuntimeError(
+            "Could not infer a usable model context window from the tokenizer/model config. "
+            "Use a model with a defined max sequence length before training or evaluation."
+        )
+    return deduped
+
+
+def resolve_model_context_window(tokenizer: Any, model: Any) -> int:
+    return min(collect_model_length_candidates(tokenizer, model=model))
+
+
+def resolve_training_token_budgets(
+    tokenizer: Any,
+    model: Any,
+    requested_max_source_length: int,
+    requested_max_target_length: int,
+) -> dict[str, int]:
+    context_window = resolve_model_context_window(tokenizer, model)
+    if requested_max_source_length <= 0:
+        raise ValueError("max_source_length must be positive.")
+    if requested_max_target_length <= 0:
+        raise ValueError("max_target_length must be positive.")
+    if context_window < 2:
+        raise ValueError(f"Model context window is too small for training: {context_window}")
+
+    effective_max_target_length = min(requested_max_target_length, context_window - 1)
+    effective_max_source_length = min(
+        requested_max_source_length,
+        context_window - effective_max_target_length,
+    )
+    if effective_max_source_length <= 0:
+        raise ValueError(
+            "Requested target budget leaves no room for prompt tokens inside the model context "
+            f"window ({context_window}). Lower max_target_length or choose a larger-context model."
+        )
+    return {
+        "context_window": context_window,
+        "max_source_length": effective_max_source_length,
+        "max_target_length": effective_max_target_length,
+    }
+
+
+def resolve_eval_token_budgets(
+    tokenizer: Any,
+    model: Any,
+    requested_max_source_length: int,
+    requested_max_new_tokens: int,
+) -> dict[str, int]:
+    context_window = resolve_model_context_window(tokenizer, model)
+    if requested_max_source_length <= 0:
+        raise ValueError("max_source_length must be positive.")
+    if requested_max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive.")
+    if context_window < 2:
+        raise ValueError(f"Model context window is too small for evaluation: {context_window}")
+
+    effective_max_source_length = min(requested_max_source_length, context_window - 1)
+    if effective_max_source_length <= 0:
+        raise ValueError(
+            f"Model context window ({context_window}) leaves no room for evaluation prompts."
+        )
+    return {
+        "context_window": context_window,
+        "max_source_length": effective_max_source_length,
+        "max_new_tokens": requested_max_new_tokens,
+    }
 
 
 def infer_lora_target_modules(model: Any, torch: Any) -> list[str]:
@@ -1037,6 +1162,21 @@ def load_model_for_training(
     return model, tokenizer, lora_summary
 
 
+def resolve_adapter_base_model_name(checkpoint_source: Path) -> str:
+    adapter_config_path = checkpoint_source / "adapter_config.json"
+    if not adapter_config_path.exists():
+        raise FileNotFoundError(f"Adapter config not found at {adapter_config_path}.")
+    payload = json.loads(adapter_config_path.read_text(encoding="utf-8"))
+    for key in ("base_model_name_or_path", "base_model_name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise RuntimeError(
+        f"Adapter checkpoint at {checkpoint_source} does not record a base model name. "
+        "Recreate the checkpoint with adapter metadata or evaluate with a full checkpoint."
+    )
+
+
 def checkpoint_contains_model_artifacts(checkpoint_path: Path) -> bool:
     has_adapter_config = (checkpoint_path / "adapter_config.json").exists()
     has_adapter_weights = any(
@@ -1113,15 +1253,17 @@ def load_model_for_inference(
         except ImportError as exc:
             raise RuntimeError("Adapter checkpoint found, but peft is not installed.") from exc
 
+        base_model_name = resolve_adapter_base_model_name(checkpoint_source)
+
         tokenizer_source = (
             str(checkpoint_source)
             if (checkpoint_source / "tokenizer_config.json").exists()
-            else model_name
+            else base_model_name
         )
         tokenizer = prepare_tokenizer(
             AutoTokenizer.from_pretrained(tokenizer_source, cache_dir=cache_root),
         )
-        base_model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        base_model = AutoModelForCausalLM.from_pretrained(base_model_name, **model_kwargs)
         model = PeftModel.from_pretrained(base_model, str(checkpoint_source))
         prepare_tokenizer(tokenizer, model=model)
         return model, tokenizer, str(checkpoint_source)
@@ -1190,29 +1332,42 @@ def generate_prediction(
     record: dict[str, Any],
     max_source_length: int,
     max_new_tokens: int,
+    model_context_window: int,
 ) -> str:
     import torch
 
     prompt_text = render_training_prompt(record)
     model_device = next(model.parameters()).device
+    prompt_token_limit = min(max_source_length, model_context_window - 1)
+    if prompt_token_limit <= 0:
+        raise ValueError(
+            f"Model context window ({model_context_window}) leaves no room for prompt tokens."
+        )
     inputs = tokenizer(
         prompt_text,
         return_tensors="pt",
         truncation=True,
-        max_length=max_source_length,
+        max_length=prompt_token_limit,
     )
     inputs = {key: value.to(model_device) for key, value in inputs.items()}
+    prompt_length = inputs["input_ids"].shape[1]
+    available_generation_tokens = model_context_window - prompt_length
+    if available_generation_tokens <= 0:
+        raise ValueError(
+            "Evaluation prompt exhausts the model context window after truncation. "
+            "Lower max_source_length or choose a larger-context model."
+        )
+    effective_max_new_tokens = min(max_new_tokens, available_generation_tokens)
 
     with torch.no_grad():
         generated = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=effective_max_new_tokens,
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
 
-    prompt_length = inputs["input_ids"].shape[1]
     generated_tokens = generated[0][prompt_length:]
     return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
@@ -1221,10 +1376,13 @@ def build_prediction_summary(prediction_rows: list[dict[str, Any]]) -> dict[str,
     if not prediction_rows:
         return {
             "num_examples": 0,
+            "num_parsed_examples": 0,
+            "num_invalid_json_examples": 0,
             "parsed_json_rate": 0.0,
-            "found_accuracy": 0.0,
-            "normalized_answer_exact_match": 0.0,
-            "evidence_exact_match": 0.0,
+            "structured_metrics_scope": "parsed_examples_only",
+            "found_accuracy": None,
+            "normalized_answer_exact_match": None,
+            "evidence_exact_match": None,
             "per_category_found_accuracy": {},
         }
 
@@ -1235,11 +1393,12 @@ def build_prediction_summary(prediction_rows: list[dict[str, Any]]) -> dict[str,
     per_category: dict[str, dict[str, int]] = {}
 
     for row in prediction_rows:
+        if not row["parsed_json"]:
+            continue
         reference = row["reference_target"]
         prediction = row["prediction_structured"]
         category = reference["category"]
-        if row["parsed_json"]:
-            parsed_count += 1
+        parsed_count += 1
         if prediction["found"] == reference["found"]:
             found_correct += 1
         if normalize_metric_text(prediction["normalized_answer"]) == normalize_metric_text(
@@ -1267,12 +1426,27 @@ def build_prediction_summary(prediction_rows: list[dict[str, Any]]) -> dict[str,
         for category, counts in sorted(per_category.items())
     }
     total = len(prediction_rows)
+    if parsed_count == 0:
+        return {
+            "num_examples": total,
+            "num_parsed_examples": 0,
+            "num_invalid_json_examples": total,
+            "parsed_json_rate": 0.0,
+            "structured_metrics_scope": "parsed_examples_only",
+            "found_accuracy": None,
+            "normalized_answer_exact_match": None,
+            "evidence_exact_match": None,
+            "per_category_found_accuracy": {},
+        }
     return {
         "num_examples": total,
+        "num_parsed_examples": parsed_count,
+        "num_invalid_json_examples": total - parsed_count,
         "parsed_json_rate": round(parsed_count / total, 4),
-        "found_accuracy": round(found_correct / total, 4),
-        "normalized_answer_exact_match": round(normalized_correct / total, 4),
-        "evidence_exact_match": round(evidence_correct / total, 4),
+        "structured_metrics_scope": "parsed_examples_only",
+        "found_accuracy": round(found_correct / parsed_count, 4),
+        "normalized_answer_exact_match": round(normalized_correct / parsed_count, 4),
+        "evidence_exact_match": round(evidence_correct / parsed_count, 4),
         "per_category_found_accuracy": per_category_accuracy,
     }
 
@@ -1584,9 +1758,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate_parser.add_argument(
         "--max-new-tokens",
+        "--max-target-length",
+        dest="max_new_tokens",
         type=int,
         default=DEFAULT_MAX_NEW_TOKENS,
-        help="Generation budget for prediction JSON.",
+        help=(
+            "Generation budget for prediction JSON. `--max-target-length` is accepted "
+            "as a compatibility alias during evaluation."
+        ),
     )
     evaluate_parser.add_argument(
         "--smoke",
@@ -1746,18 +1925,26 @@ def run_train(args: argparse.Namespace) -> int:
         lora_dropout=args.lora_dropout,
     )
     model.config.use_cache = False
+    training_budgets = resolve_training_token_budgets(
+        tokenizer,
+        model,
+        requested_max_source_length=args.max_source_length,
+        requested_max_target_length=args.max_target_length,
+    )
 
     train_features = build_generation_features(
         train_records,
         tokenizer=tokenizer,
-        max_source_length=args.max_source_length,
-        max_target_length=args.max_target_length,
+        max_source_length=training_budgets["max_source_length"],
+        max_target_length=training_budgets["max_target_length"],
+        model_context_window=training_budgets["context_window"],
     )
     validation_features = build_generation_features(
         validation_records,
         tokenizer=tokenizer,
-        max_source_length=args.max_source_length,
-        max_target_length=args.max_target_length,
+        max_source_length=training_budgets["max_source_length"],
+        max_target_length=training_budgets["max_target_length"],
+        model_context_window=training_budgets["context_window"],
     )
 
     max_train_steps = args.max_train_steps
@@ -1790,9 +1977,12 @@ def run_train(args: argparse.Namespace) -> int:
     summary.update(
         {
             "checkpoint_dir": str(checkpoint_dir),
+            "model_context_window": training_budgets["context_window"],
+            "requested_max_source_length": args.max_source_length,
+            "requested_max_target_length": args.max_target_length,
             "max_train_steps": max_train_steps,
-            "max_source_length": args.max_source_length,
-            "max_target_length": args.max_target_length,
+            "max_source_length": training_budgets["max_source_length"],
+            "max_target_length": training_budgets["max_target_length"],
             "lora": lora_summary,
             "train_feature_count": len(train_features),
             "validation_feature_count": len(validation_features),
@@ -1850,6 +2040,12 @@ def run_evaluate(args: argparse.Namespace) -> int:
             checkpoint_source=checkpoint_source,
             cache_root=roots["cache_root"],
         )
+        eval_budgets = resolve_eval_token_budgets(
+            tokenizer,
+            model,
+            requested_max_source_length=args.max_source_length,
+            requested_max_new_tokens=args.max_new_tokens,
+        )
         import torch
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1861,8 +2057,9 @@ def run_evaluate(args: argparse.Namespace) -> int:
                 model=model,
                 tokenizer=tokenizer,
                 record=record,
-                max_source_length=args.max_source_length,
-                max_new_tokens=args.max_new_tokens,
+                max_source_length=eval_budgets["max_source_length"],
+                max_new_tokens=eval_budgets["max_new_tokens"],
+                model_context_window=eval_budgets["context_window"],
             )
             prediction_structured, parsed_json, parse_error = parse_prediction_text(
                 prediction_text=prediction_text,
@@ -1893,6 +2090,12 @@ def run_evaluate(args: argparse.Namespace) -> int:
         "smoke": args.smoke,
         "dry_run": args.dry_run,
         "model_source": model_source,
+        "model_context_window": eval_budgets["context_window"] if not args.dry_run else None,
+        "requested_max_source_length": args.max_source_length,
+        "requested_max_new_tokens": args.max_new_tokens,
+        "effective_max_source_length": (
+            eval_budgets["max_source_length"] if not args.dry_run else None
+        ),
         "prediction_artifact": str(prediction_path),
         "sample_prediction_artifact": str(sample_prediction_path),
         "num_sample_predictions": min(len(prediction_rows), max(0, args.num_sample_predictions)),
