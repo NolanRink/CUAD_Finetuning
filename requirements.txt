@@ -1,7 +1,10 @@
 # Minimal v1 stack for local notebook bootstrap and later FABRIC single-GPU work.
 # Install torch separately so FABRIC can use an explicit driver-compatible CUDA wheel:
-#   python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-# For local CPU-only development, install torch from the PyTorch selector or PyPI before using train/evaluate.
+#   python -m pip install --no-cache-dir torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+# Do not install torchvision or torchaudio for this repo; they are unused here and can
+# create avoidable torch-version conflicts on fresh FABRIC nodes.
+# For local CPU-only development, install torch from the PyTorch selector or PyPI before
+# using train/evaluate.
 
 transformers<5
 datasets

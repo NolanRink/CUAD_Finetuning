@@ -85,7 +85,7 @@ FABRIC_FIRST_RUN_GUIDE = """FABRIC first run:
      python -m venv .venv
      source .venv/bin/activate
      python -m pip install --upgrade pip setuptools wheel
-     python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+     python -m pip install --no-cache-dir torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
      python -m pip install -r requirements.txt
      python -c "import torch; print('torch=', torch.__version__); print('torch_cuda=', torch.version.cuda); print('cuda_available=', torch.cuda.is_available()); print('device=', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"
 
