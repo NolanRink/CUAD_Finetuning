@@ -741,6 +741,11 @@ def write_jsonl(records: list[dict[str, Any]], filepath: Path) -> None:
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
+def append_jsonl_record(handle: Any, record: dict[str, Any]) -> None:
+    handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+    handle.flush()
+
+
 def write_json(payload: dict[str, Any], filepath: Path) -> None:
     filepath.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -2066,6 +2071,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of prediction rows to export in the sample artifact.",
     )
     evaluate_parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=25,
+        help="Print evaluation progress after this many records. Use 0 to disable periodic progress lines.",
+    )
+    evaluate_parser.add_argument(
         "--max-source-length",
         type=int,
         default=DEFAULT_MAX_SOURCE_LENGTH,
@@ -2399,18 +2410,21 @@ def run_evaluate(args: argparse.Namespace) -> int:
     metrics_path = artifact_root / args.metrics_name
     sample_prediction_path = artifact_root / args.sample_prediction_name
     prediction_rows: list[dict[str, Any]] = []
+    total_records = len(records)
+    evaluation_started_at = time.monotonic()
 
     if args.dry_run:
         model_source = "reference_copy_dry_run"
-        for record in records:
-            reference_target = json.loads(record["target_json"])
-            prediction_text = record["target_json"]
-            prediction_structured, parsed_json, parse_error = parse_prediction_text(
-                prediction_text=prediction_text,
-                fallback_category=record["category"],
-            )
-            prediction_rows.append(
-                {
+        print(f"Evaluation starting on {total_records} records using reference-copy dry run.", flush=True)
+        with prediction_path.open("w", encoding="utf-8") as prediction_handle:
+            for index, record in enumerate(records, start=1):
+                reference_target = json.loads(record["target_json"])
+                prediction_text = record["target_json"]
+                prediction_structured, parsed_json, parse_error = parse_prediction_text(
+                    prediction_text=prediction_text,
+                    fallback_category=record["category"],
+                )
+                row = {
                     "contract_id": record["contract_id"],
                     "chunk_id": record["chunk_id"],
                     "category": record["category"],
@@ -2421,7 +2435,25 @@ def run_evaluate(args: argparse.Namespace) -> int:
                     "parsed_json": parsed_json,
                     "parse_error": parse_error,
                 }
-            )
+                prediction_rows.append(row)
+                append_jsonl_record(prediction_handle, row)
+                if (
+                    total_records > 0
+                    and (
+                        index == 1
+                        or index == total_records
+                        or (args.progress_every > 0 and index % args.progress_every == 0)
+                    )
+                ):
+                    elapsed_seconds = max(time.monotonic() - evaluation_started_at, 1e-9)
+                    records_per_second = index / elapsed_seconds
+                    remaining_records = total_records - index
+                    eta_minutes = (remaining_records / records_per_second) / 60.0
+                    print(
+                        f"Evaluated {index}/{total_records} records "
+                        f"({records_per_second:.2f} records/s, eta_minutes={eta_minutes:.1f}).",
+                        flush=True,
+                    )
     else:
         configure_hf_cache(roots["cache_root"])
         checkpoint_source = resolve_checkpoint_source(args, roots)
@@ -2441,22 +2473,27 @@ def run_evaluate(args: argparse.Namespace) -> int:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model.to(device)
         model.eval()
+        print(
+            f"Evaluation starting on {total_records} records with device={device} "
+            f"from model_source={model_source}.",
+            flush=True,
+        )
 
-        for record in records:
-            prediction_text = generate_prediction(
-                model=model,
-                tokenizer=tokenizer,
-                record=record,
-                max_source_length=eval_budgets["max_source_length"],
-                max_new_tokens=eval_budgets["max_new_tokens"],
-                model_context_window=eval_budgets["context_window"],
-            )
-            prediction_structured, parsed_json, parse_error = parse_prediction_text(
-                prediction_text=prediction_text,
-                fallback_category=record["category"],
-            )
-            prediction_rows.append(
-                {
+        with prediction_path.open("w", encoding="utf-8") as prediction_handle:
+            for index, record in enumerate(records, start=1):
+                prediction_text = generate_prediction(
+                    model=model,
+                    tokenizer=tokenizer,
+                    record=record,
+                    max_source_length=eval_budgets["max_source_length"],
+                    max_new_tokens=eval_budgets["max_new_tokens"],
+                    model_context_window=eval_budgets["context_window"],
+                )
+                prediction_structured, parsed_json, parse_error = parse_prediction_text(
+                    prediction_text=prediction_text,
+                    fallback_category=record["category"],
+                )
+                row = {
                     "contract_id": record["contract_id"],
                     "chunk_id": record["chunk_id"],
                     "category": record["category"],
@@ -2467,9 +2504,26 @@ def run_evaluate(args: argparse.Namespace) -> int:
                     "parsed_json": parsed_json,
                     "parse_error": parse_error,
                 }
-            )
+                prediction_rows.append(row)
+                append_jsonl_record(prediction_handle, row)
+                if (
+                    total_records > 0
+                    and (
+                        index == 1
+                        or index == total_records
+                        or (args.progress_every > 0 and index % args.progress_every == 0)
+                    )
+                ):
+                    elapsed_seconds = max(time.monotonic() - evaluation_started_at, 1e-9)
+                    records_per_second = index / elapsed_seconds
+                    remaining_records = total_records - index
+                    eta_minutes = (remaining_records / records_per_second) / 60.0
+                    print(
+                        f"Evaluated {index}/{total_records} records "
+                        f"({records_per_second:.2f} records/s, eta_minutes={eta_minutes:.1f}).",
+                        flush=True,
+                    )
 
-    write_jsonl(prediction_rows, prediction_path)
     write_jsonl(
         prediction_rows[: max(0, args.num_sample_predictions)],
         sample_prediction_path,
@@ -2490,6 +2544,7 @@ def run_evaluate(args: argparse.Namespace) -> int:
         "sample_prediction_artifact": str(sample_prediction_path),
         "num_sample_predictions": min(len(prediction_rows), max(0, args.num_sample_predictions)),
         "metrics_artifact": str(metrics_path),
+        "evaluation_runtime_seconds": round(time.monotonic() - evaluation_started_at, 4),
         "metrics": build_prediction_summary(prediction_rows),
     }
     write_json(summary, metrics_path)
