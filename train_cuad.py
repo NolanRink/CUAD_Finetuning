@@ -8,6 +8,8 @@ import json
 import os
 import random
 import re
+import signal
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -94,6 +96,12 @@ FABRIC_FIRST_RUN_GUIDE = """FABRIC first run:
      python train_cuad.py preprocess --smoke --output-name cuad_preprocessed_smoke
      python train_cuad.py train --preprocessed-name cuad_preprocessed_smoke --smoke --max-train-steps 2 --summary-name cuad_train_summary_smoke.json
      python train_cuad.py evaluate --preprocessed-name cuad_preprocessed_smoke --smoke --checkpoint-name cuad_structured_generation --prediction-name cuad_eval_predictions_smoke.jsonl --sample-prediction-name cuad_eval_prediction_samples_smoke.jsonl --metrics-name cuad_eval_metrics_smoke.json --max-new-tokens 192
+
+  6. Inspect training observability artifacts:
+     cat /mnt/project/artifacts/cuad_train_summary.json
+     head -n 5 /mnt/project/artifacts/cuad_train_history.jsonl
+     ls -l /mnt/project/artifacts/cuad_train_loss_curve.png
+     press Ctrl+C once during training to request a graceful stop with artifact save
 """
 
 
@@ -747,6 +755,78 @@ def write_run_summary(
     return summary_path
 
 
+def write_history_artifact(
+    artifact_root: Path,
+    filename: str,
+    rows: list[dict[str, Any]],
+) -> Path:
+    history_path = artifact_root / filename
+    write_jsonl(rows, history_path)
+    return history_path
+
+
+def write_loss_curve_artifact(
+    artifact_root: Path,
+    filename: str,
+    history_rows: list[dict[str, Any]],
+) -> Path | None:
+    train_steps: list[int] = []
+    train_losses: list[float] = []
+    eval_steps: list[int] = []
+    eval_losses: list[float] = []
+
+    for row in history_rows:
+        step = row.get("step")
+        if not isinstance(step, int):
+            continue
+        loss = row.get("loss")
+        if row.get("event") == "log" and isinstance(loss, (int, float)):
+            train_steps.append(step)
+            train_losses.append(float(loss))
+        eval_loss = row.get("eval_loss")
+        if row.get("event") == "eval" and isinstance(eval_loss, (int, float)):
+            eval_steps.append(step)
+            eval_losses.append(float(eval_loss))
+
+    if not train_steps and not eval_steps:
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots(figsize=(8, 5))
+    if train_steps:
+        axis.plot(train_steps, train_losses, marker="o", linewidth=1.5, label="train_loss")
+    if eval_steps:
+        axis.plot(eval_steps, eval_losses, marker="s", linewidth=1.5, label="eval_loss")
+    axis.set_xlabel("Step")
+    axis.set_ylabel("Loss")
+    axis.set_title("Training Loss Curve")
+    axis.grid(True, alpha=0.3)
+    if train_steps or eval_steps:
+        axis.legend()
+
+    curve_path = artifact_root / filename
+    figure.tight_layout()
+    figure.savefig(curve_path, dpi=150)
+    plt.close(figure)
+    return curve_path
+
+
+def make_json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def load_jsonl(filepath: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with filepath.open("r", encoding="utf-8") as handle:
@@ -953,7 +1033,7 @@ def build_generation_features(
 def import_training_stack(
     *,
     include_trainer: bool,
-) -> tuple[Any, Any, Any | None, Any | None]:
+) -> tuple[Any, Any, Any | None, Any | None, Any | None]:
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -964,14 +1044,22 @@ def import_training_stack(
 
     Trainer = None
     TrainingArguments = None
+    TrainerCallback = None
     if include_trainer:
         try:
-            from transformers import Trainer, TrainingArguments
+            from transformers import Trainer, TrainerCallback, TrainingArguments
         except ImportError as exc:
             raise RuntimeError(
                 "Training requires Trainer and TrainingArguments from transformers."
             ) from exc
-    return torch, AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+    return (
+        torch,
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        Trainer,
+        TrainingArguments,
+        TrainerCallback,
+    )
 
 
 def choose_torch_dtype(torch: Any) -> Any | None:
@@ -1126,7 +1214,7 @@ def load_model_for_training(
     lora_alpha: int,
     lora_dropout: float,
 ) -> tuple[Any, Any, dict[str, Any]]:
-    torch, AutoModelForCausalLM, AutoTokenizer, _, _ = import_training_stack(
+    torch, AutoModelForCausalLM, AutoTokenizer, _, _, _ = import_training_stack(
         include_trainer=False,
     )
     model_kwargs: dict[str, Any] = {"cache_dir": cache_root}
@@ -1240,7 +1328,7 @@ def load_model_for_inference(
     checkpoint_source: Path | None,
     cache_root: str,
 ) -> tuple[Any, Any, str]:
-    torch, AutoModelForCausalLM, AutoTokenizer, _, _ = import_training_stack(
+    torch, AutoModelForCausalLM, AutoTokenizer, _, _, _ = import_training_stack(
         include_trainer=False,
     )
     model_kwargs: dict[str, Any] = {"cache_dir": cache_root}
@@ -1326,6 +1414,206 @@ def build_training_arguments(
         if key in supported_args and value is not None
     }
     return TrainingArguments(**compatible_kwargs)
+
+
+def install_safe_stop_handler() -> tuple[dict[str, Any], Any]:
+    state = {
+        "requested": False,
+        "signal_count": 0,
+        "requested_at_step": None,
+    }
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    def handle_sigint(signum: int, frame: Any) -> None:
+        del signum, frame
+        state["signal_count"] += 1
+        if state["signal_count"] == 1:
+            state["requested"] = True
+            print(
+                "\nSafe stop requested. Training will stop after the current step or evaluation, "
+                "save the checkpoint, and write artifacts. Press Ctrl+C again to abort immediately.",
+                flush=True,
+            )
+            return
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    return state, previous_handler
+
+
+def restore_safe_stop_handler(previous_handler: Any) -> None:
+    signal.signal(signal.SIGINT, previous_handler)
+
+
+def build_training_history_entry(
+    *,
+    event: str,
+    state: Any,
+    started_at: float,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "event": event,
+        "step": getattr(state, "global_step", None),
+        "epoch": getattr(state, "epoch", None),
+        "wall_clock_seconds": round(time.monotonic() - started_at, 4),
+    }
+    if payload:
+        entry.update(make_json_safe(payload))
+    return entry
+
+
+def resolve_best_eval_loss(history_rows: list[dict[str, Any]]) -> float | None:
+    eval_losses = [
+        row.get("eval_loss")
+        for row in history_rows
+        if row.get("event") == "eval" and isinstance(row.get("eval_loss"), (int, float))
+    ]
+    if not eval_losses:
+        return None
+    return float(min(eval_losses))
+
+
+def count_completed_eval_events(history_rows: list[dict[str, Any]]) -> int:
+    return sum(1 for row in history_rows if row.get("event") == "eval")
+
+
+def build_training_control_callback(
+    TrainerCallback: Any,
+    *,
+    safe_stop_state: dict[str, Any],
+    early_stopping_patience: int,
+    early_stopping_min_delta: float,
+    checkpoint_dir: Path,
+    tokenizer: Any,
+) -> Any:
+    class TrainingControlCallback(TrainerCallback):
+        def __init__(self) -> None:
+            self.started_at = time.monotonic()
+            self.history_rows: list[dict[str, Any]] = []
+            self.best_eval_loss: float | None = None
+            self.best_eval_step: int | None = None
+            self.evals_without_improvement = 0
+            self.stop_reason: str | None = None
+            self.manual_stop_requested = False
+            self.early_stopped = False
+            self.best_checkpoint_saved = False
+
+        def _save_best_checkpoint(self, model: Any) -> None:
+            model.save_pretrained(checkpoint_dir)
+            tokenizer.save_pretrained(checkpoint_dir)
+            self.best_checkpoint_saved = True
+
+        def on_train_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            self.history_rows.append(
+                build_training_history_entry(
+                    event="train_begin",
+                    state=state,
+                    started_at=self.started_at,
+                    payload={
+                        "early_stopping_patience": early_stopping_patience,
+                        "early_stopping_min_delta": early_stopping_min_delta,
+                    },
+                )
+            )
+            return control
+
+        def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            if safe_stop_state["requested"]:
+                self.manual_stop_requested = True
+                if safe_stop_state["requested_at_step"] is None:
+                    safe_stop_state["requested_at_step"] = getattr(state, "global_step", None)
+                if self.stop_reason is None:
+                    self.stop_reason = "safe_manual_stop_requested"
+                control.should_training_stop = True
+            return control
+
+        def on_log(
+            self,
+            args: Any,
+            state: Any,
+            control: Any,
+            logs: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> Any:
+            del args, kwargs
+            self.history_rows.append(
+                build_training_history_entry(
+                    event="log",
+                    state=state,
+                    started_at=self.started_at,
+                    payload=logs or {},
+                )
+            )
+            return control
+
+        def on_evaluate(
+            self,
+            args: Any,
+            state: Any,
+            control: Any,
+            metrics: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> Any:
+            del args, kwargs
+            payload = metrics or {}
+            self.history_rows.append(
+                build_training_history_entry(
+                    event="eval",
+                    state=state,
+                    started_at=self.started_at,
+                    payload=payload,
+                )
+            )
+            eval_loss = payload.get("eval_loss")
+            if isinstance(eval_loss, (int, float)):
+                eval_loss = float(eval_loss)
+                improvement_threshold = (
+                    self.best_eval_loss - early_stopping_min_delta
+                    if self.best_eval_loss is not None
+                    else None
+                )
+                if self.best_eval_loss is None or eval_loss < improvement_threshold:
+                    self.best_eval_loss = eval_loss
+                    self.best_eval_step = getattr(state, "global_step", None)
+                    self.evals_without_improvement = 0
+                    model = kwargs.get("model")
+                    if model is not None:
+                        self._save_best_checkpoint(model)
+                else:
+                    self.evals_without_improvement += 1
+
+                if (
+                    early_stopping_patience > 0
+                    and self.evals_without_improvement >= early_stopping_patience
+                ):
+                    self.early_stopped = True
+                    self.stop_reason = "early_stopping_no_improvement"
+                    control.should_training_stop = True
+            return control
+
+        def on_train_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            self.history_rows.append(
+                build_training_history_entry(
+                    event="train_end",
+                    state=state,
+                    started_at=self.started_at,
+                    payload={
+                        "stop_reason": self.stop_reason or "completed_budget",
+                        "best_eval_loss": self.best_eval_loss,
+                        "best_eval_step": self.best_eval_step,
+                        "manual_stop_requested": self.manual_stop_requested,
+                        "early_stopped": self.early_stopped,
+                        "best_checkpoint_saved": self.best_checkpoint_saved,
+                    },
+                )
+            )
+            return control
+
+    return TrainingControlCallback()
 
 
 def generate_prediction(
@@ -1645,7 +1933,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-train-steps",
         type=int,
         default=-1,
-        help="Optional max-step override. Use a positive value for a very small smoke train.",
+        help="Optional max-step override for a bounded run that stops cleanly before full epochs.",
+    )
+    train_parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help=(
+            "Stop early after this many evals without eval-loss improvement. "
+            "Set to 0 to disable early stopping."
+        ),
+    )
+    train_parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum eval-loss improvement required to reset early-stopping patience.",
     )
     train_parser.add_argument(
         "--disable-lora",
@@ -1696,6 +1999,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--summary-name",
         default="cuad_train_summary.json",
         help="Training summary artifact filename under artifact-root.",
+    )
+    train_parser.add_argument(
+        "--history-name",
+        default="cuad_train_history.jsonl",
+        help="Training log-history artifact filename under artifact-root.",
+    )
+    train_parser.add_argument(
+        "--loss-curve-name",
+        default="cuad_train_loss_curve.png",
+        help="Training loss-curve PNG filename under artifact-root.",
     )
     train_parser.add_argument(
         "--split-seed",
@@ -1905,16 +2218,20 @@ def run_train(args: argparse.Namespace) -> int:
             if train_records
             else None
         ),
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
     }
     if args.dry_run:
         summary["summary_artifact"] = str(artifact_root / args.summary_name)
+        summary["history_artifact"] = str(artifact_root / args.history_name)
+        summary["loss_curve_artifact"] = str(artifact_root / args.loss_curve_name)
         write_run_summary(artifact_root, args.summary_name, summary)
         print("Training dry run complete.")
         print(json.dumps(summary, indent=2))
         return 0
 
     configure_hf_cache(roots["cache_root"])
-    torch, _, _, Trainer, TrainingArguments = import_training_stack(
+    torch, _, _, Trainer, TrainingArguments, TrainerCallback = import_training_stack(
         include_trainer=True,
     )
     checkpoint_dir = ensure_directory(Path(roots["checkpoint_root"]) / args.output_name)
@@ -1965,17 +2282,60 @@ def run_train(args: argparse.Namespace) -> int:
         use_fp16=use_fp16,
         dataloader_pin_memory=torch.cuda.is_available(),
     )
+    safe_stop_state, previous_sigint_handler = install_safe_stop_handler()
+    training_control = build_training_control_callback(
+        TrainerCallback,
+        safe_stop_state=safe_stop_state,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        checkpoint_dir=checkpoint_dir,
+        tokenizer=tokenizer,
+    )
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=ListDataset(train_features),
         eval_dataset=ListDataset(validation_features) if validation_features else None,
         data_collator=SupervisedDataCollator(tokenizer.pad_token_id),
+        callbacks=[training_control],
     )
-    trainer.train()
-    trainer.save_model()
-    tokenizer.save_pretrained(checkpoint_dir)
+    train_result = None
+    stop_reason = "completed_budget"
+    interrupted = False
+    try:
+        train_result = trainer.train()
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_reason = training_control.stop_reason or "keyboard_interrupt"
+    finally:
+        restore_safe_stop_handler(previous_sigint_handler)
 
+    if not interrupted and not training_control.best_checkpoint_saved:
+        trainer.save_model()
+        tokenizer.save_pretrained(checkpoint_dir)
+
+    completed_steps = int(getattr(trainer.state, "global_step", 0) or 0)
+    completed_epoch = getattr(trainer.state, "epoch", None)
+    world_size = max(1, int(getattr(training_args, "world_size", 1)))
+    estimated_batches_seen = completed_steps * args.gradient_accumulation_steps * world_size
+    estimated_examples_seen = estimated_batches_seen * args.per_device_train_batch_size
+    history_artifact_path = write_history_artifact(
+        artifact_root,
+        args.history_name,
+        training_control.history_rows,
+    )
+    loss_curve_artifact_path = write_loss_curve_artifact(
+        artifact_root,
+        args.loss_curve_name,
+        training_control.history_rows,
+    )
+    best_eval_loss = (
+        training_control.best_eval_loss
+        if training_control.best_eval_loss is not None
+        else resolve_best_eval_loss(training_control.history_rows)
+    )
+    if training_control.stop_reason is not None:
+        stop_reason = training_control.stop_reason
     summary.update(
         {
             "checkpoint_dir": str(checkpoint_dir),
@@ -1988,13 +2348,41 @@ def run_train(args: argparse.Namespace) -> int:
             "lora": lora_summary,
             "train_feature_count": len(train_features),
             "validation_feature_count": len(validation_features),
+            "history_artifact": str(history_artifact_path),
+            "loss_curve_artifact": (
+                str(loss_curve_artifact_path) if loss_curve_artifact_path is not None else None
+            ),
+            "completed_steps": completed_steps,
+            "effective_epoch_reached": completed_epoch,
+            "estimated_batches_seen": estimated_batches_seen,
+            "estimated_examples_seen": estimated_examples_seen,
+            "wall_clock_runtime_seconds": round(time.monotonic() - training_control.started_at, 4),
+            "train_runtime_metrics": make_json_safe(train_result.metrics) if train_result else None,
+            "completed_eval_events": count_completed_eval_events(training_control.history_rows),
+            "early_stopping_enabled": args.early_stopping_patience > 0 and bool(validation_features),
+            "best_eval_loss": best_eval_loss,
+            "best_eval_step": training_control.best_eval_step,
+            "best_checkpoint_dir": str(checkpoint_dir) if training_control.best_checkpoint_saved else None,
+            "best_checkpoint_saved": training_control.best_checkpoint_saved,
+            "saved_checkpoint_selection": (
+                "best_eval" if training_control.best_checkpoint_saved else "final_state"
+            ),
+            "manual_stop_requested": training_control.manual_stop_requested,
+            "manual_stop_signal_count": safe_stop_state["signal_count"],
+            "manual_stop_requested_at_step": safe_stop_state["requested_at_step"],
+            "early_stopped": training_control.early_stopped,
+            "stop_reason": stop_reason,
+            "checkpoint_saved": not interrupted,
         }
     )
     summary["summary_artifact"] = str(artifact_root / args.summary_name)
     write_run_summary(artifact_root, args.summary_name, summary)
-    print("Training complete.")
+    if interrupted:
+        print("Training interrupted before a graceful stop completed.")
+    else:
+        print("Training complete.")
     print(json.dumps(summary, indent=2))
-    return 0
+    return 130 if interrupted else 0
 
 
 def run_evaluate(args: argparse.Namespace) -> int:
