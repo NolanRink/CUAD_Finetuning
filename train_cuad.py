@@ -1557,7 +1557,7 @@ def build_training_control_callback(
             metrics: dict[str, Any] | None = None,
             **kwargs: Any,
         ) -> Any:
-            del args, kwargs
+            del args
             payload = metrics or {}
             self.history_rows.append(
                 build_training_history_entry(
