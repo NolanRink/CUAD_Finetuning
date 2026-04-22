@@ -1667,6 +1667,72 @@ def generate_prediction(
     return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
 
+def generate_predictions_batch(
+    model: Any,
+    tokenizer: Any,
+    records: list[dict[str, Any]],
+    max_source_length: int,
+    max_new_tokens: int,
+    model_context_window: int,
+) -> list[str]:
+    import torch
+
+    if not records:
+        return []
+
+    prompt_token_limit = min(max_source_length, model_context_window - 1)
+    if prompt_token_limit <= 0:
+        raise ValueError(
+            f"Model context window ({model_context_window}) leaves no room for prompt tokens."
+        )
+
+    prompt_texts = [render_training_prompt(record) for record in records]
+    model_device = next(model.parameters()).device
+    original_padding_side = getattr(tokenizer, "padding_side", "right")
+    tokenizer.padding_side = "left"
+    try:
+        inputs = tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=prompt_token_limit,
+        )
+    finally:
+        tokenizer.padding_side = original_padding_side
+
+    inputs = {key: value.to(model_device) for key, value in inputs.items()}
+    prompt_lengths = inputs["attention_mask"].sum(dim=1)
+    available_generation_tokens = model_context_window - prompt_lengths
+    effective_max_new_tokens = min(
+        max_new_tokens,
+        int(available_generation_tokens.min().item()),
+    )
+    if effective_max_new_tokens <= 0:
+        raise ValueError(
+            "Evaluation prompt batch exhausts the model context window after truncation. "
+            "Lower max_source_length or choose a larger-context model."
+        )
+
+    input_width = inputs["input_ids"].shape[1]
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=effective_max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    prediction_texts: list[str] = []
+    for generated_row in generated:
+        generated_tokens = generated_row[input_width:]
+        prediction_texts.append(
+            tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        )
+    return prediction_texts
+
+
 def build_prediction_summary(prediction_rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not prediction_rows:
         return {
@@ -2077,6 +2143,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print evaluation progress after this many records. Use 0 to disable periodic progress lines.",
     )
     evaluate_parser.add_argument(
+        "--per-device-eval-batch-size",
+        type=int,
+        default=4,
+        help="Batch size for generation during evaluation. Lower it if you hit GPU memory limits.",
+    )
+    evaluate_parser.add_argument(
         "--max-source-length",
         type=int,
         default=DEFAULT_MAX_SOURCE_LENGTH,
@@ -2479,37 +2551,42 @@ def run_evaluate(args: argparse.Namespace) -> int:
             flush=True,
         )
 
+        batch_size = max(1, args.per_device_eval_batch_size)
         with prediction_path.open("w", encoding="utf-8") as prediction_handle:
-            for index, record in enumerate(records, start=1):
-                prediction_text = generate_prediction(
+            for batch_start in range(0, total_records, batch_size):
+                batch_records = records[batch_start : batch_start + batch_size]
+                prediction_texts = generate_predictions_batch(
                     model=model,
                     tokenizer=tokenizer,
-                    record=record,
+                    records=batch_records,
                     max_source_length=eval_budgets["max_source_length"],
                     max_new_tokens=eval_budgets["max_new_tokens"],
                     model_context_window=eval_budgets["context_window"],
                 )
-                prediction_structured, parsed_json, parse_error = parse_prediction_text(
-                    prediction_text=prediction_text,
-                    fallback_category=record["category"],
-                )
-                row = {
-                    "contract_id": record["contract_id"],
-                    "chunk_id": record["chunk_id"],
-                    "category": record["category"],
-                    "source_id": record.get("source_id"),
-                    "prediction_text": prediction_text,
-                    "prediction_structured": prediction_structured,
-                    "reference_target": json.loads(record["target_json"]),
-                    "parsed_json": parsed_json,
-                    "parse_error": parse_error,
-                }
-                prediction_rows.append(row)
-                append_jsonl_record(prediction_handle, row)
+                for record, prediction_text in zip(batch_records, prediction_texts):
+                    prediction_structured, parsed_json, parse_error = parse_prediction_text(
+                        prediction_text=prediction_text,
+                        fallback_category=record["category"],
+                    )
+                    row = {
+                        "contract_id": record["contract_id"],
+                        "chunk_id": record["chunk_id"],
+                        "category": record["category"],
+                        "source_id": record.get("source_id"),
+                        "prediction_text": prediction_text,
+                        "prediction_structured": prediction_structured,
+                        "reference_target": json.loads(record["target_json"]),
+                        "parsed_json": parsed_json,
+                        "parse_error": parse_error,
+                    }
+                    prediction_rows.append(row)
+                    append_jsonl_record(prediction_handle, row)
+
+                index = len(prediction_rows)
                 if (
                     total_records > 0
                     and (
-                        index == 1
+                        index <= batch_size
                         or index == total_records
                         or (args.progress_every > 0 and index % args.progress_every == 0)
                     )
@@ -2520,6 +2597,7 @@ def run_evaluate(args: argparse.Namespace) -> int:
                     eta_minutes = (remaining_records / records_per_second) / 60.0
                     print(
                         f"Evaluated {index}/{total_records} records "
+                        f"with batch_size={batch_size} "
                         f"({records_per_second:.2f} records/s, eta_minutes={eta_minutes:.1f}).",
                         flush=True,
                     )
@@ -2535,6 +2613,7 @@ def run_evaluate(args: argparse.Namespace) -> int:
         "dry_run": args.dry_run,
         "model_source": model_source,
         "model_context_window": eval_budgets["context_window"] if not args.dry_run else None,
+        "per_device_eval_batch_size": args.per_device_eval_batch_size if not args.dry_run else None,
         "requested_max_source_length": args.max_source_length,
         "requested_max_new_tokens": args.max_new_tokens,
         "effective_max_source_length": (
