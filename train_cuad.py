@@ -1126,15 +1126,19 @@ def import_extractive_qa_stack(
     Trainer = None
     TrainingArguments = None
     TrainerCallback = None
-    data_collator = None
+    DataCollatorWithPadding = None
     if include_trainer:
         try:
-            from transformers import Trainer, TrainerCallback, TrainingArguments, default_data_collator
+            from transformers import (
+                DataCollatorWithPadding,
+                Trainer,
+                TrainerCallback,
+                TrainingArguments,
+            )
         except ImportError as exc:
             raise RuntimeError(
                 "Extractive QA baseline requires Trainer and TrainingArguments from transformers."
             ) from exc
-        data_collator = default_data_collator
     return (
         torch,
         AutoModelForQuestionAnswering,
@@ -1142,7 +1146,7 @@ def import_extractive_qa_stack(
         Trainer,
         TrainingArguments,
         TrainerCallback,
-        data_collator,
+        DataCollatorWithPadding,
     )
 
 
@@ -3071,7 +3075,7 @@ def run_train_extractive(args: argparse.Namespace) -> int:
         Trainer,
         TrainingArguments,
         TrainerCallback,
-        data_collator,
+        DataCollatorWithPadding,
     ) = import_extractive_qa_stack(include_trainer=True)
     checkpoint_dir = ensure_directory(Path(roots["checkpoint_root"]) / args.output_name)
     model, tokenizer, model_source = load_extractive_qa_model(
@@ -3118,6 +3122,7 @@ def run_train_extractive(args: argparse.Namespace) -> int:
         checkpoint_dir=checkpoint_dir,
         tokenizer=tokenizer,
     )
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
     trainer = Trainer(
         model=model,
         args=training_args,
