@@ -33,6 +33,12 @@ DEFAULT_QWEN_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_EXTRACTIVE_QA_MODEL_NAME = "deepset/bert-base-cased-squad2"
 DEFAULT_CHECKPOINT_NAME = "cuad_structured_generation"
 DEFAULT_EXTRACTIVE_QA_CHECKPOINT_NAME = "cuad_extractive_qa"
+DEFAULT_EVAL_PREDICTION_NAME = "cuad_eval_predictions.jsonl"
+DEFAULT_EVAL_METRICS_NAME = "cuad_eval_metrics.json"
+DEFAULT_EVAL_SAMPLE_PREDICTION_NAME = "cuad_eval_prediction_samples.jsonl"
+DEFAULT_ZERO_SHOT_EVAL_PREDICTION_NAME = "cuad_zero_shot_eval_predictions.jsonl"
+DEFAULT_ZERO_SHOT_EVAL_METRICS_NAME = "cuad_zero_shot_eval_metrics.json"
+DEFAULT_ZERO_SHOT_EVAL_SAMPLE_PREDICTION_NAME = "cuad_zero_shot_eval_prediction_samples.jsonl"
 
 CUAD_DATASET_URL = "https://github.com/TheAtticusProject/cuad/raw/main/data.zip"
 CUAD_RAW_DIR_NAME = "cuad_qa_raw"
@@ -102,10 +108,21 @@ FABRIC_FIRST_RUN_GUIDE = """FABRIC first run:
      python train_cuad.py train --preprocessed-name cuad_preprocessed_smoke --smoke --max-train-steps 2 --summary-name cuad_train_summary_smoke.json
      python train_cuad.py evaluate --preprocessed-name cuad_preprocessed_smoke --smoke --checkpoint-name cuad_structured_generation --prediction-name cuad_eval_predictions_smoke.jsonl --sample-prediction-name cuad_eval_prediction_samples_smoke.jsonl --metrics-name cuad_eval_metrics_smoke.json --max-new-tokens 192
 
-  6. Inspect training observability artifacts:
-     cat /mnt/project/artifacts/cuad_train_summary.json
-     head -n 5 /mnt/project/artifacts/cuad_train_history.jsonl
-     ls -l /mnt/project/artifacts/cuad_train_loss_curve.png
+  6. Run one full structured-generation experiment after the smoke pass succeeds:
+     python train_cuad.py preprocess --output-name cuad_preprocessed_main
+     python train_cuad.py train --preprocessed-name cuad_preprocessed_main --output-name cuad_structured_generation_main --summary-name cuad_train_summary_main.json --history-name cuad_train_history_main.jsonl --loss-curve-name cuad_train_loss_curve_main.png
+     python train_cuad.py evaluate --preprocessed-name cuad_preprocessed_main --checkpoint-name cuad_structured_generation_main --prediction-name cuad_eval_predictions_main.jsonl --sample-prediction-name cuad_eval_prediction_samples_main.jsonl --metrics-name cuad_eval_metrics_main.json --max-new-tokens 192
+
+  7. Optional comparison runs after the main structured-generation model is complete:
+     python train_cuad.py evaluate --preprocessed-name cuad_preprocessed_main --zero-shot-baseline --prediction-name cuad_zero_shot_eval_predictions_main.jsonl --sample-prediction-name cuad_zero_shot_eval_prediction_samples_main.jsonl --metrics-name cuad_zero_shot_eval_metrics_main.json
+     python train_cuad.py evaluate-extractive --preprocessed-name cuad_preprocessed_main --checkpoint-name cuad_extractive_qa --prediction-name cuad_extractive_eval_predictions_main.jsonl --sample-prediction-name cuad_extractive_eval_prediction_samples_main.jsonl --metrics-name cuad_extractive_eval_metrics_main.json
+     Main comparison baseline: extractive QA.
+     Additional lightweight comparison: zero-shot generative baseline.
+
+  8. Inspect training observability artifacts from the run you just completed:
+     cat /mnt/project/artifacts/cuad_train_summary_main.json
+     head -n 5 /mnt/project/artifacts/cuad_train_history_main.jsonl
+     ls -l /mnt/project/artifacts/cuad_train_loss_curve_main.png
      press Ctrl+C once during training to request a graceful stop with artifact save
 """
 
@@ -2217,7 +2234,10 @@ def build_parser() -> argparse.ArgumentParser:
     preprocess_parser.add_argument(
         "--output-name",
         default=CUAD_PREPROCESSED_DIR_NAME,
-        help="Name of the derived preprocessing directory under data-root.",
+        help=(
+            "Name of the derived preprocessing directory under data-root. Pass the same "
+            "value to train/evaluate --preprocessed-name."
+        ),
     )
     preprocess_parser.add_argument(
         "--validation-contract-fraction",
@@ -2264,7 +2284,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--preprocessed-name",
         default=CUAD_PREPROCESSED_DIR_NAME,
-        help="Derived preprocessing directory name under data-root.",
+        help="Derived preprocessing directory name under data-root from preprocess --output-name.",
     )
     train_parser.add_argument(
         "--train-split",
@@ -2279,7 +2299,10 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--output-name",
         default=DEFAULT_CHECKPOINT_NAME,
-        help="Checkpoint folder name under checkpoint-root.",
+        help=(
+            "Checkpoint folder name under checkpoint-root. Pass the same value to "
+            "evaluate --checkpoint-name for the fine-tuned model."
+        ),
     )
     train_parser.add_argument(
         "--max-source-length",
@@ -2421,7 +2444,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument(
         "--preprocessed-name",
         default=CUAD_PREPROCESSED_DIR_NAME,
-        help="Derived preprocessing directory name under data-root.",
+        help="Derived preprocessing directory name under data-root from preprocess --output-name.",
     )
     evaluate_parser.add_argument(
         "--split",
@@ -2430,8 +2453,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate_parser.add_argument(
         "--checkpoint-name",
-        default=DEFAULT_CHECKPOINT_NAME,
-        help="Checkpoint directory name under checkpoint-root.",
+        default=None,
+        help=(
+            "Checkpoint directory name under checkpoint-root for the fine-tuned model. "
+            "Used by normal evaluation and should match train --output-name; "
+            f"defaults to {DEFAULT_CHECKPOINT_NAME} when omitted."
+        ),
     )
     evaluate_parser.add_argument(
         "--checkpoint-path",
@@ -2439,19 +2466,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional explicit checkpoint path.",
     )
     evaluate_parser.add_argument(
+        "--zero-shot-baseline",
+        action="store_true",
+        help=(
+            "Evaluate the untuned base instruct model directly as a lightweight "
+            "zero-shot generative baseline. This mode evaluates the base model "
+            "directly, does not accept checkpoint arguments, and uses zero-shot "
+            "artifact filenames by default."
+        ),
+    )
+    evaluate_parser.add_argument(
         "--prediction-name",
-        default="cuad_eval_predictions.jsonl",
-        help="Prediction artifact filename under artifact-root.",
+        default=None,
+        help=(
+            "Prediction artifact filename under artifact-root. Defaults to the standard "
+            "evaluation filename, or a zero-shot-specific filename when "
+            "--zero-shot-baseline is used."
+        ),
     )
     evaluate_parser.add_argument(
         "--metrics-name",
-        default="cuad_eval_metrics.json",
-        help="Summary metrics artifact filename under artifact-root.",
+        default=None,
+        help=(
+            "Summary metrics artifact filename under artifact-root. Defaults to the "
+            "standard evaluation filename, or a zero-shot-specific filename when "
+            "--zero-shot-baseline is used."
+        ),
     )
     evaluate_parser.add_argument(
         "--sample-prediction-name",
-        default="cuad_eval_prediction_samples.jsonl",
-        help="Sample prediction artifact filename under artifact-root.",
+        default=None,
+        help=(
+            "Sample prediction artifact filename under artifact-root. Defaults to the "
+            "standard evaluation filename, or a zero-shot-specific filename when "
+            "--zero-shot-baseline is used."
+        ),
     )
     evaluate_parser.add_argument(
         "--num-sample-predictions",
@@ -2840,8 +2889,12 @@ def run_train(args: argparse.Namespace) -> int:
         )
 
     summary: dict[str, Any] = {
+        "training_mode": "finetuned_structured_generation",
+        "comparison_role": "main_structured_generation_model",
         "preprocessed_dir": str(preprocessed_dir),
+        "preprocessed_name": args.preprocessed_name,
         "model_name": model_name,
+        "checkpoint_name": args.output_name,
         "smoke": args.smoke,
         "dry_run": args.dry_run,
         "train_split": args.train_split,
@@ -3387,9 +3440,24 @@ def run_evaluate(args: argparse.Namespace) -> int:
         records = sample_records(records, args.smoke_max_eval_records, args.split_seed)
 
     artifact_root = ensure_directory(Path(roots["artifact_root"]))
-    prediction_path = artifact_root / args.prediction_name
-    metrics_path = artifact_root / args.metrics_name
-    sample_prediction_path = artifact_root / args.sample_prediction_name
+    prediction_name = args.prediction_name or (
+        DEFAULT_ZERO_SHOT_EVAL_PREDICTION_NAME
+        if args.zero_shot_baseline
+        else DEFAULT_EVAL_PREDICTION_NAME
+    )
+    metrics_name = args.metrics_name or (
+        DEFAULT_ZERO_SHOT_EVAL_METRICS_NAME
+        if args.zero_shot_baseline
+        else DEFAULT_EVAL_METRICS_NAME
+    )
+    sample_prediction_name = args.sample_prediction_name or (
+        DEFAULT_ZERO_SHOT_EVAL_SAMPLE_PREDICTION_NAME
+        if args.zero_shot_baseline
+        else DEFAULT_EVAL_SAMPLE_PREDICTION_NAME
+    )
+    prediction_path = artifact_root / prediction_name
+    metrics_path = artifact_root / metrics_name
+    sample_prediction_path = artifact_root / sample_prediction_name
     prediction_rows: list[dict[str, Any]] = []
     total_records = len(records)
     evaluation_started_at = time.monotonic()
@@ -3437,7 +3505,11 @@ def run_evaluate(args: argparse.Namespace) -> int:
                     )
     else:
         configure_hf_cache(roots["cache_root"])
-        checkpoint_source = resolve_checkpoint_source(args, roots)
+        checkpoint_source = None
+        evaluation_mode = "zero_shot_base_model" if args.zero_shot_baseline else "checkpoint_model"
+        if not args.zero_shot_baseline:
+            args.checkpoint_name = args.checkpoint_name or DEFAULT_CHECKPOINT_NAME
+            checkpoint_source = resolve_checkpoint_source(args, roots)
         model, tokenizer, model_source = load_model_for_inference(
             model_name=model_name,
             checkpoint_source=checkpoint_source,
@@ -3456,7 +3528,7 @@ def run_evaluate(args: argparse.Namespace) -> int:
         model.eval()
         print(
             f"Evaluation starting on {total_records} records with device={device} "
-            f"from model_source={model_source}.",
+            f"from model_source={model_source} in mode={evaluation_mode}.",
             flush=True,
         )
 
@@ -3521,6 +3593,20 @@ def run_evaluate(args: argparse.Namespace) -> int:
         "smoke": args.smoke,
         "dry_run": args.dry_run,
         "model_source": model_source,
+        "evaluation_mode": (
+            "reference_copy_dry_run"
+            if args.dry_run
+            else ("zero_shot_base_model" if args.zero_shot_baseline else "checkpoint_model")
+        ),
+        "comparison_role": (
+            "reference_copy_dry_run"
+            if args.dry_run
+            else (
+                "lightweight_additional_zero_shot_baseline"
+                if args.zero_shot_baseline
+                else "structured_generation_model"
+            )
+        ),
         "model_context_window": eval_budgets["context_window"] if not args.dry_run else None,
         "per_device_eval_batch_size": args.per_device_eval_batch_size if not args.dry_run else None,
         "requested_max_source_length": args.max_source_length,
@@ -3541,9 +3627,22 @@ def run_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def validate_cli_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if (
+        args.command == "evaluate"
+        and getattr(args, "zero_shot_baseline", False)
+        and (args.checkpoint_name is not None or args.checkpoint_path is not None)
+    ):
+        parser.error(
+            "--zero-shot-baseline evaluates the untuned base model directly; "
+            "do not pass --checkpoint-name or --checkpoint-path."
+        )
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    validate_cli_args(parser, args)
     return args.func(args)
 
 
