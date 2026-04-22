@@ -1670,7 +1670,11 @@ def build_training_arguments(
         "num_train_epochs": args.num_train_epochs,
         "max_steps": args.max_train_steps,
         "logging_steps": 1,
-        "eval_steps": 1 if has_validation else None,
+        "eval_steps": (
+            args.eval_every_steps
+            if has_validation and args.eval_every_steps > 0
+            else None
+        ),
         "save_strategy": "no",
         "report_to": [],
         "remove_unused_columns": False,
@@ -1681,8 +1685,12 @@ def build_training_arguments(
     }
     if "evaluation_strategy" in supported_args:
         training_kwargs["evaluation_strategy"] = "steps" if has_validation else "no"
+        if not has_validation or args.eval_every_steps <= 0:
+            training_kwargs["evaluation_strategy"] = "no"
     elif "eval_strategy" in supported_args:
         training_kwargs["eval_strategy"] = "steps" if has_validation else "no"
+        if not has_validation or args.eval_every_steps <= 0:
+            training_kwargs["eval_strategy"] = "no"
 
     compatible_kwargs = {
         key: value
@@ -2325,8 +2333,17 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--per-device-eval-batch-size",
         type=int,
-        default=1,
-        help="Per-device evaluation batch size.",
+        default=8,
+        help="Per-device evaluation batch size during training. Lower it if you hit GPU memory limits.",
+    )
+    train_parser.add_argument(
+        "--eval-every-steps",
+        type=int,
+        default=200,
+        help=(
+            "Run validation every N optimizer steps during training. "
+            "Set to 0 to disable training-time validation."
+        ),
     )
     train_parser.add_argument(
         "--gradient-accumulation-steps",
@@ -2608,6 +2625,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="Per-device evaluation batch size.",
+    )
+    train_extractive_parser.add_argument(
+        "--eval-every-steps",
+        type=int,
+        default=200,
+        help=(
+            "Run validation every N optimizer steps during training. "
+            "Set to 0 to disable training-time validation."
+        ),
     )
     train_extractive_parser.add_argument(
         "--gradient-accumulation-steps",
@@ -2913,6 +2939,7 @@ def run_train(args: argparse.Namespace) -> int:
         ),
         "early_stopping_patience": args.early_stopping_patience,
         "early_stopping_min_delta": args.early_stopping_min_delta,
+        "eval_every_steps": args.eval_every_steps,
     }
     if args.dry_run:
         summary["summary_artifact"] = str(artifact_root / args.summary_name)
@@ -3109,6 +3136,7 @@ def run_train_extractive(args: argparse.Namespace) -> int:
         "context_preview": truncate_preview_text(train_records[0]["input_text"]) if train_records else None,
         "early_stopping_patience": args.early_stopping_patience,
         "early_stopping_min_delta": args.early_stopping_min_delta,
+        "eval_every_steps": args.eval_every_steps,
         "max_seq_length": args.max_seq_length,
     }
     if args.dry_run:
@@ -3244,7 +3272,11 @@ def run_train_extractive(args: argparse.Namespace) -> int:
             "wall_clock_runtime_seconds": round(time.monotonic() - training_control.started_at, 4),
             "train_runtime_metrics": make_json_safe(train_result.metrics) if train_result else None,
             "completed_eval_events": count_completed_eval_events(training_control.history_rows),
-            "early_stopping_enabled": args.early_stopping_patience > 0 and bool(validation_features),
+            "early_stopping_enabled": (
+                args.early_stopping_patience > 0
+                and bool(validation_features)
+                and args.eval_every_steps > 0
+            ),
             "best_eval_loss": best_eval_loss,
             "best_eval_step": training_control.best_eval_step,
             "best_checkpoint_dir": str(checkpoint_dir) if training_control.best_checkpoint_saved else None,
