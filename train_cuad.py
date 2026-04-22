@@ -30,7 +30,9 @@ LOCAL_ARTIFACT_ROOT = PROJECT_ROOT / "artifacts"
 
 DEFAULT_MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 DEFAULT_QWEN_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_EXTRACTIVE_QA_MODEL_NAME = "deepset/bert-base-cased-squad2"
 DEFAULT_CHECKPOINT_NAME = "cuad_structured_generation"
+DEFAULT_EXTRACTIVE_QA_CHECKPOINT_NAME = "cuad_extractive_qa"
 
 CUAD_DATASET_URL = "https://github.com/TheAtticusProject/cuad/raw/main/data.zip"
 CUAD_RAW_DIR_NAME = "cuad_qa_raw"
@@ -48,6 +50,9 @@ DEFAULT_MAX_NEGATIVE_CHUNKS_PER_CATEGORY = 1
 DEFAULT_MAX_SOURCE_LENGTH = 1024
 DEFAULT_MAX_TARGET_LENGTH = 192
 DEFAULT_MAX_NEW_TOKENS = 192
+DEFAULT_EXTRACTIVE_MAX_SEQ_LENGTH = 384
+DEFAULT_EXTRACTIVE_MAX_ANSWER_LENGTH = 64
+DEFAULT_EXTRACTIVE_NO_ANSWER_THRESHOLD = 0.0
 DEFAULT_LEARNING_RATE = 2e-4
 DEFAULT_NUM_TRAIN_EPOCHS = 1.0
 
@@ -291,6 +296,45 @@ def render_training_prompt(record: dict[str, Any]) -> str:
         f"Contract chunk:\n{record['input_text']}\n\n"
         "JSON:\n"
     )
+
+
+def render_extractive_question(record: dict[str, Any]) -> str:
+    category = record["category"]
+    return (
+        f"What is the exact contract span for the CUAD category '{category}'? "
+        "If the category is absent in this chunk, answer no span."
+    )
+
+
+def split_answer_candidates(text: str | None) -> list[str]:
+    if not isinstance(text, str):
+        return []
+    candidates: list[str] = []
+    for piece in [text, *text.split(";")]:
+        cleaned = piece.strip()
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+    return candidates
+
+
+def locate_extractive_answer_span(
+    context_text: str,
+    target: dict[str, Any],
+) -> tuple[str, int, int] | None:
+    if not target["found"]:
+        return None
+
+    candidate_sources = [
+        target.get("evidence_text"),
+        target.get("normalized_answer"),
+    ]
+    for source in candidate_sources:
+        for candidate in split_answer_candidates(source):
+            start_char = context_text.find(candidate)
+            if start_char != -1:
+                end_char = start_char + len(candidate)
+                return candidate, start_char, end_char
+    return None
 
 
 def extract_category(question: str, question_id: str) -> str:
@@ -1067,6 +1111,41 @@ def import_training_stack(
     )
 
 
+def import_extractive_qa_stack(
+    *,
+    include_trainer: bool,
+) -> tuple[Any, Any, Any, Any | None, Any | None, Any | None, Any | None]:
+    try:
+        import torch
+        from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Extractive QA baseline requires torch and transformers from requirements.txt."
+        ) from exc
+
+    Trainer = None
+    TrainingArguments = None
+    TrainerCallback = None
+    data_collator = None
+    if include_trainer:
+        try:
+            from transformers import Trainer, TrainerCallback, TrainingArguments, default_data_collator
+        except ImportError as exc:
+            raise RuntimeError(
+                "Extractive QA baseline requires Trainer and TrainingArguments from transformers."
+            ) from exc
+        data_collator = default_data_collator
+    return (
+        torch,
+        AutoModelForQuestionAnswering,
+        AutoTokenizer,
+        Trainer,
+        TrainingArguments,
+        TrainerCallback,
+        data_collator,
+    )
+
+
 def choose_torch_dtype(torch: Any) -> Any | None:
     if not torch.cuda.is_available():
         return None
@@ -1377,6 +1456,176 @@ def load_model_for_inference(
     return model, tokenizer, model_source
 
 
+def load_extractive_qa_model(
+    model_name: str,
+    cache_root: str,
+    *,
+    checkpoint_source: Path | None = None,
+) -> tuple[Any, Any, str]:
+    (
+        torch,
+        AutoModelForQuestionAnswering,
+        AutoTokenizer,
+        _,
+        _,
+        _,
+        _,
+    ) = import_extractive_qa_stack(include_trainer=False)
+    model_kwargs: dict[str, Any] = {"cache_dir": cache_root}
+    torch_dtype = choose_torch_dtype(torch)
+    if torch_dtype is not None:
+        model_kwargs["torch_dtype"] = torch_dtype
+        model_kwargs["low_cpu_mem_usage"] = True
+
+    model_source = str(checkpoint_source) if checkpoint_source is not None else model_name
+    tokenizer_source = (
+        str(checkpoint_source)
+        if checkpoint_source is not None and (checkpoint_source / "tokenizer_config.json").exists()
+        else model_source
+    )
+    tokenizer = prepare_tokenizer(
+        AutoTokenizer.from_pretrained(tokenizer_source, cache_dir=cache_root),
+    )
+    model = AutoModelForQuestionAnswering.from_pretrained(model_source, **model_kwargs)
+    prepare_tokenizer(tokenizer, model=model)
+    return model, tokenizer, model_source
+
+
+def build_extractive_qa_features(
+    records: list[dict[str, Any]],
+    tokenizer: Any,
+    *,
+    max_seq_length: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    features: list[dict[str, Any]] = []
+    positive_examples = 0
+    aligned_positive_examples = 0
+    positive_without_span = 0
+    no_answer_examples = 0
+
+    for record in records:
+        target = json.loads(record["target_json"])
+        question = render_extractive_question(record)
+        context_text = record["input_text"]
+        tokenized = tokenizer(
+            question,
+            context_text,
+            truncation="only_second",
+            max_length=max_seq_length,
+            return_offsets_mapping=True,
+        )
+        offsets = tokenized.pop("offset_mapping")
+        sequence_ids = tokenized.sequence_ids()
+        cls_token_id = tokenizer.cls_token_id
+        cls_index = tokenized["input_ids"].index(cls_token_id) if cls_token_id in tokenized["input_ids"] else 0
+
+        answer_span = locate_extractive_answer_span(context_text, target)
+        if target["found"]:
+            positive_examples += 1
+        else:
+            no_answer_examples += 1
+
+        start_position = cls_index
+        end_position = cls_index
+        if answer_span is not None:
+            _, answer_start_char, answer_end_char = answer_span
+            context_token_indexes = [index for index, sid in enumerate(sequence_ids) if sid == 1]
+            if context_token_indexes:
+                context_start = context_token_indexes[0]
+                context_end = context_token_indexes[-1]
+                if (
+                    offsets[context_start][0] <= answer_start_char
+                    and offsets[context_end][1] >= answer_end_char
+                ):
+                    start_position = context_start
+                    while (
+                        start_position <= context_end
+                        and offsets[start_position][0] <= answer_start_char
+                    ):
+                        start_position += 1
+                    start_position -= 1
+
+                    end_position = context_end
+                    while (
+                        end_position >= context_start
+                        and offsets[end_position][1] >= answer_end_char
+                    ):
+                        end_position -= 1
+                    end_position += 1
+                    aligned_positive_examples += 1
+                else:
+                    positive_without_span += 1
+            else:
+                positive_without_span += 1
+        elif target["found"]:
+            positive_without_span += 1
+
+        feature = {
+            key: value
+            for key, value in tokenized.items()
+            if key != "offset_mapping"
+        }
+        feature["start_positions"] = start_position
+        feature["end_positions"] = end_position
+        features.append(feature)
+
+    stats = {
+        "positive_examples": positive_examples,
+        "aligned_positive_examples": aligned_positive_examples,
+        "positive_without_span": positive_without_span,
+        "no_answer_examples": no_answer_examples,
+    }
+    return features, stats
+
+
+def extract_best_qa_span(
+    start_logits: list[float],
+    end_logits: list[float],
+    offsets: list[Any],
+    sequence_ids: list[Any],
+    context_text: str,
+    *,
+    cls_index: int,
+    max_answer_length: int,
+    no_answer_threshold: float,
+) -> tuple[bool, str | None, float, float]:
+    top_k = min(20, len(start_logits))
+    start_indexes = sorted(range(len(start_logits)), key=lambda idx: start_logits[idx], reverse=True)[:top_k]
+    end_indexes = sorted(range(len(end_logits)), key=lambda idx: end_logits[idx], reverse=True)[:top_k]
+    null_score = float(start_logits[cls_index] + end_logits[cls_index])
+
+    best_text: str | None = None
+    best_score: float | None = None
+    for start_index in start_indexes:
+        for end_index in end_indexes:
+            if sequence_ids[start_index] != 1 or sequence_ids[end_index] != 1:
+                continue
+            if end_index < start_index:
+                continue
+            if end_index - start_index + 1 > max_answer_length:
+                continue
+            start_offset = offsets[start_index]
+            end_offset = offsets[end_index]
+            if not isinstance(start_offset, (list, tuple)) or not isinstance(end_offset, (list, tuple)):
+                continue
+            if len(start_offset) != 2 or len(end_offset) != 2:
+                continue
+            start_char, _ = start_offset
+            _, end_char = end_offset
+            if end_char <= start_char:
+                continue
+            candidate_text = context_text[start_char:end_char].strip()
+            if not candidate_text:
+                continue
+            score = float(start_logits[start_index] + end_logits[end_index])
+            if best_score is None or score > best_score:
+                best_score = score
+                best_text = candidate_text
+
+    if best_text is None or best_score is None or best_score <= null_score + no_answer_threshold:
+        return False, None, null_score, null_score
+    return True, best_text, best_score, null_score
+
 def build_training_arguments(
     TrainingArguments: Any,
     checkpoint_dir: Path,
@@ -1386,6 +1635,7 @@ def build_training_arguments(
     use_bf16: bool,
     use_fp16: bool,
     dataloader_pin_memory: bool,
+    label_names: list[str] | None = None,
 ) -> Any:
     """Adapt Trainer args across transformers releases with small API drift."""
     supported_args = set(inspect.signature(TrainingArguments.__init__).parameters)
@@ -1403,7 +1653,7 @@ def build_training_arguments(
         "save_strategy": "no",
         "report_to": [],
         "remove_unused_columns": False,
-        "label_names": ["labels"],
+        "label_names": label_names if label_names is not None else ["labels"],
         "bf16": use_bf16,
         "fp16": use_fp16,
         "dataloader_pin_memory": dataloader_pin_memory,
@@ -1729,8 +1979,77 @@ def generate_predictions_batch(
         generated_tokens = generated_row[input_width:]
         prediction_texts.append(
             tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-        )
+    )
     return prediction_texts
+
+
+def predict_extractive_answers_batch(
+    model: Any,
+    tokenizer: Any,
+    records: list[dict[str, Any]],
+    *,
+    max_seq_length: int,
+    max_answer_length: int,
+    no_answer_threshold: float,
+) -> list[dict[str, Any]]:
+    import torch
+
+    if not records:
+        return []
+
+    questions = [render_extractive_question(record) for record in records]
+    contexts = [record["input_text"] for record in records]
+    model_device = next(model.parameters()).device
+    encodings = tokenizer(
+        questions,
+        contexts,
+        truncation="only_second",
+        padding=True,
+        max_length=max_seq_length,
+        return_offsets_mapping=True,
+    )
+    offset_mappings = encodings.pop("offset_mapping")
+    inputs = {
+        key: torch.tensor(value, dtype=torch.long, device=model_device)
+        for key, value in encodings.items()
+    }
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    start_logits = outputs.start_logits.detach().cpu().tolist()
+    end_logits = outputs.end_logits.detach().cpu().tolist()
+
+    predictions: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        sequence_ids = encodings.sequence_ids(index)
+        input_ids = encodings["input_ids"][index]
+        cls_token_id = tokenizer.cls_token_id
+        cls_index = input_ids.index(cls_token_id) if cls_token_id in input_ids else 0
+        found, answer_text, best_score, null_score = extract_best_qa_span(
+            start_logits[index],
+            end_logits[index],
+            offset_mappings[index],
+            sequence_ids,
+            record["input_text"],
+            cls_index=cls_index,
+            max_answer_length=max_answer_length,
+            no_answer_threshold=no_answer_threshold,
+        )
+        prediction_structured = build_structured_target(
+            category=record["category"],
+            found=found,
+            normalized_answer=answer_text if found else None,
+            evidence_text=answer_text if found else None,
+        )
+        predictions.append(
+            {
+                "prediction_structured": prediction_structured,
+                "qa_best_span_score": best_score,
+                "qa_null_score": null_score,
+            }
+        )
+    return predictions
 
 
 def build_prediction_summary(prediction_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2189,6 +2508,240 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate_parser.set_defaults(func=run_evaluate)
 
+    train_extractive_parser = subparsers.add_parser(
+        "train-extractive",
+        help="Train a simple extractive QA baseline on preprocessed CUAD data.",
+    )
+    add_shared_paths(train_extractive_parser)
+    train_extractive_parser.add_argument(
+        "--model-name",
+        default=DEFAULT_EXTRACTIVE_QA_MODEL_NAME,
+        help="Extractive QA baseline model to fine-tune.",
+    )
+    train_extractive_parser.add_argument(
+        "--preprocessed-name",
+        default=CUAD_PREPROCESSED_DIR_NAME,
+        help="Derived preprocessing directory name under data-root.",
+    )
+    train_extractive_parser.add_argument(
+        "--train-split",
+        default="train",
+        help="Training split name after preprocessing.",
+    )
+    train_extractive_parser.add_argument(
+        "--validation-split",
+        default="validation",
+        help="Validation split name after preprocessing.",
+    )
+    train_extractive_parser.add_argument(
+        "--output-name",
+        default=DEFAULT_EXTRACTIVE_QA_CHECKPOINT_NAME,
+        help="Checkpoint folder name under checkpoint-root.",
+    )
+    train_extractive_parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=DEFAULT_EXTRACTIVE_MAX_SEQ_LENGTH,
+        help="Maximum tokenized question+context length for extractive QA.",
+    )
+    train_extractive_parser.add_argument(
+        "--per-device-train-batch-size",
+        type=int,
+        default=8,
+        help="Per-device training batch size.",
+    )
+    train_extractive_parser.add_argument(
+        "--per-device-eval-batch-size",
+        type=int,
+        default=8,
+        help="Per-device evaluation batch size.",
+    )
+    train_extractive_parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps for the Trainer loop.",
+    )
+    train_extractive_parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=3e-5,
+        help="Learning rate for AdamW.",
+    )
+    train_extractive_parser.add_argument(
+        "--num-train-epochs",
+        type=float,
+        default=2.0,
+        help="Number of training epochs when max steps is not specified.",
+    )
+    train_extractive_parser.add_argument(
+        "--max-train-steps",
+        type=int,
+        default=-1,
+        help="Optional max-step override for a bounded baseline run.",
+    )
+    train_extractive_parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="Stop early after this many evals without eval-loss improvement. Set to 0 to disable early stopping.",
+    )
+    train_extractive_parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum eval-loss improvement required to reset early-stopping patience.",
+    )
+    train_extractive_parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Use a tiny sample and tiny step budget.",
+    )
+    train_extractive_parser.add_argument(
+        "--smoke-max-train-records",
+        type=int,
+        default=DEFAULT_SMOKE_MAX_TRAIN_RECORDS,
+        help="Training-record cap used with --smoke.",
+    )
+    train_extractive_parser.add_argument(
+        "--smoke-max-validation-records",
+        type=int,
+        default=DEFAULT_SMOKE_MAX_VALIDATION_RECORDS,
+        help="Validation-record cap used with --smoke.",
+    )
+    train_extractive_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate data and print a training summary without downloading or training a model.",
+    )
+    train_extractive_parser.add_argument(
+        "--summary-name",
+        default="cuad_extractive_train_summary.json",
+        help="Training summary artifact filename under artifact-root.",
+    )
+    train_extractive_parser.add_argument(
+        "--history-name",
+        default="cuad_extractive_train_history.jsonl",
+        help="Training log-history artifact filename under artifact-root.",
+    )
+    train_extractive_parser.add_argument(
+        "--loss-curve-name",
+        default="cuad_extractive_train_loss_curve.png",
+        help="Training loss-curve PNG filename under artifact-root.",
+    )
+    train_extractive_parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=DEFAULT_SPLIT_SEED,
+        help="Deterministic sampling seed for smoke mode.",
+    )
+    train_extractive_parser.set_defaults(func=run_train_extractive)
+
+    evaluate_extractive_parser = subparsers.add_parser(
+        "evaluate-extractive",
+        help="Evaluate the extractive QA baseline on a preprocessed CUAD split.",
+    )
+    add_shared_paths(evaluate_extractive_parser)
+    evaluate_extractive_parser.add_argument(
+        "--model-name",
+        default=DEFAULT_EXTRACTIVE_QA_MODEL_NAME,
+        help="Extractive QA baseline model to load when no checkpoint is provided.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--preprocessed-name",
+        default=CUAD_PREPROCESSED_DIR_NAME,
+        help="Derived preprocessing directory name under data-root.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--split",
+        default="test",
+        help="Dataset split to evaluate.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--checkpoint-name",
+        default=DEFAULT_EXTRACTIVE_QA_CHECKPOINT_NAME,
+        help="Checkpoint directory name under checkpoint-root.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--checkpoint-path",
+        default=None,
+        help="Optional explicit checkpoint path.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--prediction-name",
+        default="cuad_extractive_eval_predictions.jsonl",
+        help="Prediction artifact filename under artifact-root.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--metrics-name",
+        default="cuad_extractive_eval_metrics.json",
+        help="Summary metrics artifact filename under artifact-root.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--sample-prediction-name",
+        default="cuad_extractive_eval_prediction_samples.jsonl",
+        help="Sample prediction artifact filename under artifact-root.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--num-sample-predictions",
+        type=int,
+        default=25,
+        help="Number of prediction rows to export in the sample artifact.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=100,
+        help="Print evaluation progress after this many records. Use 0 to disable periodic progress lines.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--per-device-eval-batch-size",
+        type=int,
+        default=16,
+        help="Batch size for extractive QA inference. Lower it if you hit GPU memory limits.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=DEFAULT_EXTRACTIVE_MAX_SEQ_LENGTH,
+        help="Maximum tokenized question+context length for extractive QA.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--max-answer-length",
+        type=int,
+        default=DEFAULT_EXTRACTIVE_MAX_ANSWER_LENGTH,
+        help="Maximum answer span length in tokens during inference.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--no-answer-threshold",
+        type=float,
+        default=DEFAULT_EXTRACTIVE_NO_ANSWER_THRESHOLD,
+        help="Extra score margin the best span must beat the null score by to predict found=true.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Evaluate only a tiny subset.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--smoke-max-eval-records",
+        type=int,
+        default=DEFAULT_SMOKE_MAX_EVAL_RECORDS,
+        help="Evaluation-record cap used with --smoke.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write reference-copy predictions without loading a model.",
+    )
+    evaluate_extractive_parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=DEFAULT_SPLIT_SEED,
+        help="Deterministic sampling seed for smoke mode.",
+    )
+    evaluate_extractive_parser.set_defaults(func=run_evaluate_extractive)
+
     return parser
 
 
@@ -2364,6 +2917,7 @@ def run_train(args: argparse.Namespace) -> int:
         use_bf16=use_bf16,
         use_fp16=use_fp16,
         dataloader_pin_memory=torch.cuda.is_available(),
+        label_names=["labels"],
     )
     safe_stop_state, previous_sigint_handler = install_safe_stop_handler()
     training_control = build_training_control_callback(
@@ -2466,6 +3020,356 @@ def run_train(args: argparse.Namespace) -> int:
         print("Training complete.")
     print(json.dumps(summary, indent=2))
     return 130 if interrupted else 0
+
+
+def run_train_extractive(args: argparse.Namespace) -> int:
+    roots = resolve_roots(args)
+    ensure_runtime_roots(roots)
+    preprocessed_dir = Path(roots["data_root"]) / args.preprocessed_name
+    train_records = load_preprocessed_split(preprocessed_dir, args.train_split)
+    validation_records = load_preprocessed_split(preprocessed_dir, args.validation_split)
+    artifact_root = ensure_directory(Path(roots["artifact_root"]))
+
+    if args.smoke:
+        train_records = sample_records(train_records, args.smoke_max_train_records, args.split_seed)
+        validation_records = sample_records(
+            validation_records,
+            args.smoke_max_validation_records,
+            args.split_seed,
+        )
+
+    summary: dict[str, Any] = {
+        "baseline_type": "extractive_qa",
+        "preprocessed_dir": str(preprocessed_dir),
+        "model_name": args.model_name,
+        "smoke": args.smoke,
+        "dry_run": args.dry_run,
+        "train_split": args.train_split,
+        "validation_split": args.validation_split,
+        "train_summary": summarize_split(train_records),
+        "validation_summary": summarize_split(validation_records),
+        "question_preview": render_extractive_question(train_records[0]) if train_records else None,
+        "context_preview": truncate_preview_text(train_records[0]["input_text"]) if train_records else None,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
+        "max_seq_length": args.max_seq_length,
+    }
+    if args.dry_run:
+        summary["summary_artifact"] = str(artifact_root / args.summary_name)
+        summary["history_artifact"] = str(artifact_root / args.history_name)
+        summary["loss_curve_artifact"] = str(artifact_root / args.loss_curve_name)
+        write_run_summary(artifact_root, args.summary_name, summary)
+        print("Extractive QA training dry run complete.")
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    configure_hf_cache(roots["cache_root"])
+    (
+        torch,
+        _,
+        _,
+        Trainer,
+        TrainingArguments,
+        TrainerCallback,
+        data_collator,
+    ) = import_extractive_qa_stack(include_trainer=True)
+    checkpoint_dir = ensure_directory(Path(roots["checkpoint_root"]) / args.output_name)
+    model, tokenizer, model_source = load_extractive_qa_model(
+        model_name=args.model_name,
+        cache_root=roots["cache_root"],
+    )
+    model_context_window = resolve_model_context_window(tokenizer, model)
+    max_seq_length = min(args.max_seq_length, model_context_window)
+
+    train_features, train_alignment_stats = build_extractive_qa_features(
+        train_records,
+        tokenizer,
+        max_seq_length=max_seq_length,
+    )
+    validation_features, validation_alignment_stats = build_extractive_qa_features(
+        validation_records,
+        tokenizer,
+        max_seq_length=max_seq_length,
+    )
+
+    max_train_steps = args.max_train_steps
+    if args.smoke and max_train_steps <= 0:
+        max_train_steps = DEFAULT_SMOKE_MAX_STEPS
+
+    use_bf16 = torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+    use_fp16 = torch.cuda.is_available() and not use_bf16
+    args.max_train_steps = max_train_steps
+    training_args = build_training_arguments(
+        TrainingArguments,
+        checkpoint_dir,
+        args,
+        has_validation=bool(validation_features),
+        use_bf16=use_bf16,
+        use_fp16=use_fp16,
+        dataloader_pin_memory=torch.cuda.is_available(),
+        label_names=["start_positions", "end_positions"],
+    )
+    safe_stop_state, previous_sigint_handler = install_safe_stop_handler()
+    training_control = build_training_control_callback(
+        TrainerCallback,
+        safe_stop_state=safe_stop_state,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        checkpoint_dir=checkpoint_dir,
+        tokenizer=tokenizer,
+    )
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=ListDataset(train_features),
+        eval_dataset=ListDataset(validation_features) if validation_features else None,
+        data_collator=data_collator,
+        callbacks=[training_control],
+    )
+    train_result = None
+    stop_reason = "completed_budget"
+    interrupted = False
+    try:
+        train_result = trainer.train()
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_reason = training_control.stop_reason or "keyboard_interrupt"
+    finally:
+        restore_safe_stop_handler(previous_sigint_handler)
+
+    if not interrupted and not training_control.best_checkpoint_saved:
+        trainer.save_model()
+        tokenizer.save_pretrained(checkpoint_dir)
+
+    completed_steps = int(getattr(trainer.state, "global_step", 0) or 0)
+    completed_epoch = getattr(trainer.state, "epoch", None)
+    world_size = max(1, int(getattr(training_args, "world_size", 1)))
+    estimated_batches_seen = completed_steps * args.gradient_accumulation_steps * world_size
+    estimated_examples_seen = estimated_batches_seen * args.per_device_train_batch_size
+    history_artifact_path = write_history_artifact(
+        artifact_root,
+        args.history_name,
+        training_control.history_rows,
+    )
+    loss_curve_artifact_path = write_loss_curve_artifact(
+        artifact_root,
+        args.loss_curve_name,
+        training_control.history_rows,
+    )
+    best_eval_loss = (
+        training_control.best_eval_loss
+        if training_control.best_eval_loss is not None
+        else resolve_best_eval_loss(training_control.history_rows)
+    )
+    if training_control.stop_reason is not None:
+        stop_reason = training_control.stop_reason
+
+    summary.update(
+        {
+            "model_source": model_source,
+            "checkpoint_dir": str(checkpoint_dir),
+            "model_context_window": model_context_window,
+            "effective_max_seq_length": max_seq_length,
+            "max_train_steps": max_train_steps,
+            "train_feature_count": len(train_features),
+            "validation_feature_count": len(validation_features),
+            "train_alignment_stats": train_alignment_stats,
+            "validation_alignment_stats": validation_alignment_stats,
+            "history_artifact": str(history_artifact_path),
+            "loss_curve_artifact": (
+                str(loss_curve_artifact_path) if loss_curve_artifact_path is not None else None
+            ),
+            "completed_steps": completed_steps,
+            "effective_epoch_reached": completed_epoch,
+            "estimated_batches_seen": estimated_batches_seen,
+            "estimated_examples_seen": estimated_examples_seen,
+            "wall_clock_runtime_seconds": round(time.monotonic() - training_control.started_at, 4),
+            "train_runtime_metrics": make_json_safe(train_result.metrics) if train_result else None,
+            "completed_eval_events": count_completed_eval_events(training_control.history_rows),
+            "early_stopping_enabled": args.early_stopping_patience > 0 and bool(validation_features),
+            "best_eval_loss": best_eval_loss,
+            "best_eval_step": training_control.best_eval_step,
+            "best_checkpoint_dir": str(checkpoint_dir) if training_control.best_checkpoint_saved else None,
+            "best_checkpoint_saved": training_control.best_checkpoint_saved,
+            "saved_checkpoint_selection": (
+                "best_eval" if training_control.best_checkpoint_saved else "final_state"
+            ),
+            "manual_stop_requested": training_control.manual_stop_requested,
+            "manual_stop_signal_count": safe_stop_state["signal_count"],
+            "manual_stop_requested_at_step": safe_stop_state["requested_at_step"],
+            "early_stopped": training_control.early_stopped,
+            "stop_reason": stop_reason,
+            "checkpoint_saved": not interrupted,
+        }
+    )
+    summary["summary_artifact"] = str(artifact_root / args.summary_name)
+    write_run_summary(artifact_root, args.summary_name, summary)
+    if interrupted:
+        print("Extractive QA training interrupted before a graceful stop completed.")
+    else:
+        print("Extractive QA training complete.")
+    print(json.dumps(summary, indent=2))
+    return 130 if interrupted else 0
+
+
+def run_evaluate_extractive(args: argparse.Namespace) -> int:
+    roots = resolve_roots(args)
+    ensure_runtime_roots(roots)
+    preprocessed_dir = Path(roots["data_root"]) / args.preprocessed_name
+    records = load_preprocessed_split(preprocessed_dir, args.split)
+    if args.smoke:
+        records = sample_records(records, args.smoke_max_eval_records, args.split_seed)
+
+    artifact_root = ensure_directory(Path(roots["artifact_root"]))
+    prediction_path = artifact_root / args.prediction_name
+    metrics_path = artifact_root / args.metrics_name
+    sample_prediction_path = artifact_root / args.sample_prediction_name
+    prediction_rows: list[dict[str, Any]] = []
+    total_records = len(records)
+    evaluation_started_at = time.monotonic()
+
+    if args.dry_run:
+        model_source = "reference_copy_dry_run"
+        print(f"Extractive QA evaluation starting on {total_records} records using reference-copy dry run.", flush=True)
+        with prediction_path.open("w", encoding="utf-8") as prediction_handle:
+            for index, record in enumerate(records, start=1):
+                reference_target = json.loads(record["target_json"])
+                row = {
+                    "contract_id": record["contract_id"],
+                    "chunk_id": record["chunk_id"],
+                    "category": record["category"],
+                    "source_id": record.get("source_id"),
+                    "prediction_text": reference_target["evidence_text"],
+                    "prediction_structured": reference_target,
+                    "reference_target": reference_target,
+                    "parsed_json": True,
+                    "parse_error": None,
+                    "qa_best_span_score": None,
+                    "qa_null_score": None,
+                }
+                prediction_rows.append(row)
+                append_jsonl_record(prediction_handle, row)
+                if (
+                    total_records > 0
+                    and (
+                        index == 1
+                        or index == total_records
+                        or (args.progress_every > 0 and index % args.progress_every == 0)
+                    )
+                ):
+                    elapsed_seconds = max(time.monotonic() - evaluation_started_at, 1e-9)
+                    records_per_second = index / elapsed_seconds
+                    remaining_records = total_records - index
+                    eta_minutes = (remaining_records / records_per_second) / 60.0
+                    print(
+                        f"Evaluated {index}/{total_records} extractive QA records "
+                        f"({records_per_second:.2f} records/s, eta_minutes={eta_minutes:.1f}).",
+                        flush=True,
+                    )
+    else:
+        configure_hf_cache(roots["cache_root"])
+        checkpoint_source = resolve_checkpoint_source(args, roots)
+        model, tokenizer, model_source = load_extractive_qa_model(
+            model_name=args.model_name,
+            checkpoint_source=checkpoint_source,
+            cache_root=roots["cache_root"],
+        )
+        model_context_window = resolve_model_context_window(tokenizer, model)
+        max_seq_length = min(args.max_seq_length, model_context_window)
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+        model.eval()
+        print(
+            f"Extractive QA evaluation starting on {total_records} records with device={device} "
+            f"from model_source={model_source}.",
+            flush=True,
+        )
+
+        batch_size = max(1, args.per_device_eval_batch_size)
+        with prediction_path.open("w", encoding="utf-8") as prediction_handle:
+            for batch_start in range(0, total_records, batch_size):
+                batch_records = records[batch_start : batch_start + batch_size]
+                batch_predictions = predict_extractive_answers_batch(
+                    model=model,
+                    tokenizer=tokenizer,
+                    records=batch_records,
+                    max_seq_length=max_seq_length,
+                    max_answer_length=args.max_answer_length,
+                    no_answer_threshold=args.no_answer_threshold,
+                )
+                for record, prediction in zip(batch_records, batch_predictions):
+                    reference_target = json.loads(record["target_json"])
+                    prediction_text = prediction["prediction_structured"]["evidence_text"]
+                    row = {
+                        "contract_id": record["contract_id"],
+                        "chunk_id": record["chunk_id"],
+                        "category": record["category"],
+                        "source_id": record.get("source_id"),
+                        "prediction_text": prediction_text,
+                        "prediction_structured": prediction["prediction_structured"],
+                        "reference_target": reference_target,
+                        "parsed_json": True,
+                        "parse_error": None,
+                        "qa_best_span_score": prediction["qa_best_span_score"],
+                        "qa_null_score": prediction["qa_null_score"],
+                    }
+                    prediction_rows.append(row)
+                    append_jsonl_record(prediction_handle, row)
+
+                index = len(prediction_rows)
+                if (
+                    total_records > 0
+                    and (
+                        index <= batch_size
+                        or index == total_records
+                        or (args.progress_every > 0 and index % args.progress_every == 0)
+                    )
+                ):
+                    elapsed_seconds = max(time.monotonic() - evaluation_started_at, 1e-9)
+                    records_per_second = index / elapsed_seconds
+                    remaining_records = total_records - index
+                    eta_minutes = (remaining_records / records_per_second) / 60.0
+                    print(
+                        f"Evaluated {index}/{total_records} extractive QA records with batch_size={batch_size} "
+                        f"({records_per_second:.2f} records/s, eta_minutes={eta_minutes:.1f}).",
+                        flush=True,
+                    )
+
+    write_jsonl(
+        prediction_rows[: max(0, args.num_sample_predictions)],
+        sample_prediction_path,
+    )
+    summary = {
+        "baseline_type": "extractive_qa",
+        "preprocessed_dir": str(preprocessed_dir),
+        "evaluated_split": args.split,
+        "smoke": args.smoke,
+        "dry_run": args.dry_run,
+        "model_source": model_source,
+        "model_context_window": (model_context_window if not args.dry_run else None),
+        "max_seq_length": args.max_seq_length,
+        "effective_max_seq_length": (max_seq_length if not args.dry_run else None),
+        "max_answer_length": args.max_answer_length if not args.dry_run else None,
+        "no_answer_threshold": args.no_answer_threshold if not args.dry_run else None,
+        "per_device_eval_batch_size": args.per_device_eval_batch_size if not args.dry_run else None,
+        "prediction_artifact": str(prediction_path),
+        "sample_prediction_artifact": str(sample_prediction_path),
+        "num_sample_predictions": min(len(prediction_rows), max(0, args.num_sample_predictions)),
+        "metrics_artifact": str(metrics_path),
+        "evaluation_runtime_seconds": round(time.monotonic() - evaluation_started_at, 4),
+        "comparison_notes": (
+            "found_accuracy is directly comparable to the structured-generation path. "
+            "normalized_answer_exact_match and evidence_exact_match compare the single extracted span "
+            "against the structured-generation references."
+        ),
+        "metrics": build_prediction_summary(prediction_rows),
+    }
+    write_json(summary, metrics_path)
+    print("Extractive QA evaluation complete.")
+    print(json.dumps(summary, indent=2))
+    return 0
 
 
 def run_evaluate(args: argparse.Namespace) -> int:
