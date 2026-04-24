@@ -1,0 +1,92 @@
+{
+  "baseline_type": "extractive_qa",
+  "preprocessed_dir": "/mnt/project/data/cuad_preprocessed_v1",
+  "model_name": "deepset/bert-base-cased-squad2",
+  "smoke": false,
+  "dry_run": false,
+  "train_split": "train",
+  "validation_split": "validation",
+  "train_summary": {
+    "num_records": 51704,
+    "num_contracts": 367,
+    "num_chunks": 11123,
+    "num_positive": 31751,
+    "num_no_answer": 19953,
+    "num_categories": 41,
+    "sample_categories": {
+      "Affiliate License-Licensee": 471,
+      "Affiliate License-Licensor": 433,
+      "Agreement Date": 1053,
+      "Anti-Assignment": 1142,
+      "Audit Rights": 1253
+    }
+  },
+  "validation_summary": {
+    "num_records": 5568,
+    "num_contracts": 41,
+    "num_chunks": 1105,
+    "num_positive": 3321,
+    "num_no_answer": 2247,
+    "num_categories": 41,
+    "sample_categories": {
+      "Affiliate License-Licensee": 66,
+      "Affiliate License-Licensor": 54,
+      "Agreement Date": 97,
+      "Anti-Assignment": 122,
+      "Audit Rights": 148
+    }
+  },
+  "question_preview": "What is the exact contract span for the CUAD category 'Document Name'? If the category is absent in this chunk, answer no span.",
+  "context_preview": "Exhibit 10.26    CONFIDENTIAL TREATMENT HAS BEEN REQUESTED AS TO CERTAIN PORTIONS OF THIS DOCUMENT. EACH SUCH PORTION,  WHICH HAS BEEN OMITTED HEREIN AND REPLACED WITH AN ASTERISK [*], HAS BEEN FILED SEPARATELY WITH THE  SECURITIES AND EXCHANGE COMMISSION.     PROMOTION AND DISTRIBUTION AGREEMENT     This Promotion and Distribution Agreement including all exhibits (collectively referred to as t...",
+  "early_stopping_patience": 5,
+  "early_stopping_min_delta": 0.0,
+  "max_seq_length": 384,
+  "model_source": "deepset/bert-base-cased-squad2",
+  "checkpoint_dir": "/mnt/project/checkpoints/cuad_extractive_qa_v1",
+  "model_context_window": 512,
+  "effective_max_seq_length": 384,
+  "max_train_steps": 200,
+  "train_feature_count": 51704,
+  "validation_feature_count": 5568,
+  "train_alignment_stats": {
+    "positive_examples": 31751,
+    "aligned_positive_examples": 26298,
+    "positive_without_span": 5453,
+    "no_answer_examples": 19953
+  },
+  "validation_alignment_stats": {
+    "positive_examples": 3321,
+    "aligned_positive_examples": 2808,
+    "positive_without_span": 513,
+    "no_answer_examples": 2247
+  },
+  "history_artifact": "/mnt/project/artifacts/cuad_extractive_train_history_v1.jsonl",
+  "loss_curve_artifact": "/mnt/project/artifacts/cuad_extractive_train_loss_curve_v1.png",
+  "completed_steps": 29,
+  "effective_epoch_reached": 0.004487080303264738,
+  "estimated_batches_seen": 29,
+  "estimated_examples_seen": 232,
+  "wall_clock_runtime_seconds": 1982.6816,
+  "train_runtime_metrics": {
+    "train_runtime": 1981.5456,
+    "train_samples_per_second": 0.807,
+    "train_steps_per_second": 0.101,
+    "total_flos": 45465635672064.0,
+    "train_loss": 3.3285719772865034,
+    "epoch": 0.004487080303264738
+  },
+  "completed_eval_events": 29,
+  "early_stopping_enabled": true,
+  "best_eval_loss": 2.490691900253296,
+  "best_eval_step": 24,
+  "best_checkpoint_dir": "/mnt/project/checkpoints/cuad_extractive_qa_v1",
+  "best_checkpoint_saved": true,
+  "saved_checkpoint_selection": "best_eval",
+  "manual_stop_requested": false,
+  "manual_stop_signal_count": 0,
+  "manual_stop_requested_at_step": null,
+  "early_stopped": true,
+  "stop_reason": "early_stopping_no_improvement",
+  "checkpoint_saved": true,
+  "summary_artifact": "/mnt/project/artifacts/cuad_extractive_train_summary_v1.json"
+}

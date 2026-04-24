@@ -1,0 +1,63 @@
+{
+  "dataset_root": "/mnt/project/data/cuad_qa_raw",
+  "raw_files": {
+    "train": "/mnt/project/data/cuad_qa_raw/train_separate_questions.json",
+    "test": "/mnt/project/data/cuad_qa_raw/test.json"
+  },
+  "output_dir": "/mnt/project/data/cuad_preprocessed_main",
+  "smoke": false,
+  "chunk_size_chars": 2200,
+  "chunk_stride_chars": 1600,
+  "max_negative_chunks_per_category": 1,
+  "split_seed": 13,
+  "validation_contract_fraction": 0.1,
+  "raw_train_contracts": 408,
+  "raw_test_contracts": 102,
+  "splits": {
+    "train": {
+      "num_records": 51704,
+      "num_contracts": 367,
+      "num_chunks": 11123,
+      "num_positive": 31751,
+      "num_no_answer": 19953,
+      "num_categories": 41,
+      "sample_categories": {
+        "Affiliate License-Licensee": 471,
+        "Affiliate License-Licensor": 433,
+        "Agreement Date": 1053,
+        "Anti-Assignment": 1142,
+        "Audit Rights": 1253
+      }
+    },
+    "validation": {
+      "num_records": 5568,
+      "num_contracts": 41,
+      "num_chunks": 1105,
+      "num_positive": 3321,
+      "num_no_answer": 2247,
+      "num_categories": 41,
+      "sample_categories": {
+        "Affiliate License-Licensee": 66,
+        "Affiliate License-Licensor": 54,
+        "Agreement Date": 97,
+        "Anti-Assignment": 122,
+        "Audit Rights": 148
+      }
+    },
+    "test": {
+      "num_records": 8493,
+      "num_contracts": 102,
+      "num_chunks": 2617,
+      "num_positive": 4366,
+      "num_no_answer": 4127,
+      "num_categories": 41,
+      "sample_categories": {
+        "Affiliate License-Licensee": 122,
+        "Affiliate License-Licensor": 116,
+        "Agreement Date": 232,
+        "Anti-Assignment": 222,
+        "Audit Rights": 185
+      }
+    }
+  }
+}
