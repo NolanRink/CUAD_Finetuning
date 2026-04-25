@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import inspect
 import json
 import os
@@ -124,6 +125,12 @@ FABRIC_FIRST_RUN_GUIDE = """FABRIC first run:
      head -n 5 /mnt/project/artifacts/cuad_train_history_main.jsonl
      ls -l /mnt/project/artifacts/cuad_train_loss_curve_main.png
      press Ctrl+C once during training to request a graceful stop with artifact save
+
+  9. After the corrected extractive rerun is complete, rescore saved predictions with richer metrics and generate plots:
+     python train_cuad.py score-predictions --prediction-path /mnt/project/artifacts/cuad_eval_predictions_main.jsonl --metadata-path /mnt/project/artifacts/cuad_eval_metrics_main.json --metrics-name cuad_eval_metrics_main_report.json --method-label "Fine-tuned Structured Generation"
+     python train_cuad.py score-predictions --prediction-path /mnt/project/artifacts/cuad_extractive_eval_predictions_final.jsonl --metadata-path /mnt/project/artifacts/cuad_extractive_eval_metrics_final.json --metrics-name cuad_extractive_eval_metrics_final_report.json --method-label "Extractive QA Baseline"
+     python train_cuad.py score-predictions --prediction-path /mnt/project/artifacts/cuad_zero_shot_eval_predictions_main.jsonl --metadata-path /mnt/project/artifacts/cuad_zero_shot_eval_metrics_main.json --metrics-name cuad_zero_shot_eval_metrics_main_report.json --method-label "Zero-Shot Generative Baseline"
+     python train_cuad.py plot-results --structured-metrics-path /mnt/project/artifacts/cuad_eval_metrics_main_report.json --extractive-metrics-path /mnt/project/artifacts/cuad_extractive_eval_metrics_final_report.json --zero-shot-metrics-path /mnt/project/artifacts/cuad_zero_shot_eval_metrics_main_report.json --output-prefix cuad_final_results
 """
 
 
@@ -901,6 +908,10 @@ def load_jsonl(filepath: Path) -> list[dict[str, Any]]:
             if stripped:
                 records.append(json.loads(stripped))
     return records
+
+
+def load_json(filepath: Path) -> dict[str, Any]:
+    return json.loads(filepath.read_text(encoding="utf-8"))
 
 
 def validate_preprocessed_record(record: dict[str, Any]) -> None:
@@ -2081,6 +2092,304 @@ def predict_extractive_answers_batch(
     return predictions
 
 
+def tokenize_metric_text(value: Any) -> list[str]:
+    normalized = normalize_metric_text(value)
+    if normalized is None:
+        return []
+    return normalized.split(" ")
+
+
+def round_metric(value: float | None, digits: int = 4) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def safe_ratio(numerator: int | float, denominator: int | float) -> float | None:
+    if denominator == 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def compute_token_f1(prediction_value: Any, reference_value: Any) -> float:
+    prediction_tokens = tokenize_metric_text(prediction_value)
+    reference_tokens = tokenize_metric_text(reference_value)
+    if not prediction_tokens and not reference_tokens:
+        return 1.0
+    if not prediction_tokens or not reference_tokens:
+        return 0.0
+
+    prediction_counts = Counter(prediction_tokens)
+    reference_counts = Counter(reference_tokens)
+    overlap = sum(
+        min(prediction_counts[token], reference_counts[token])
+        for token in prediction_counts.keys() & reference_counts.keys()
+    )
+    if overlap <= 0:
+        return 0.0
+
+    precision = overlap / len(prediction_tokens)
+    recall = overlap / len(reference_tokens)
+    return (2.0 * precision * recall) / (precision + recall)
+
+
+def compute_jaccard_overlap(prediction_value: Any, reference_value: Any) -> float:
+    prediction_tokens = set(tokenize_metric_text(prediction_value))
+    reference_tokens = set(tokenize_metric_text(reference_value))
+    if not prediction_tokens and not reference_tokens:
+        return 1.0
+    if not prediction_tokens or not reference_tokens:
+        return 0.0
+    return len(prediction_tokens & reference_tokens) / len(prediction_tokens | reference_tokens)
+
+
+def compute_text_scope_metrics(
+    rows: list[dict[str, Any]],
+    *,
+    field_name: str,
+    require_positive_reference: bool,
+    parsed_only: bool,
+) -> dict[str, Any]:
+    denominator = 0
+    exact_match_sum = 0
+    token_f1_sum = 0.0
+    jaccard_sum = 0.0
+    overlap_at_50_sum = 0
+
+    for row in rows:
+        if parsed_only and not row["parsed_json"]:
+            continue
+
+        reference = row["reference_target"]
+        if require_positive_reference and not reference["found"]:
+            continue
+
+        denominator += 1
+        if not row["parsed_json"]:
+            continue
+
+        prediction = row["prediction_structured"]
+        prediction_value = prediction.get(field_name)
+        reference_value = reference.get(field_name)
+        if normalize_metric_text(prediction_value) == normalize_metric_text(reference_value):
+            exact_match_sum += 1
+        token_f1 = compute_token_f1(prediction_value, reference_value)
+        token_f1_sum += token_f1
+        jaccard = compute_jaccard_overlap(prediction_value, reference_value)
+        jaccard_sum += jaccard
+        if jaccard >= 0.5:
+            overlap_at_50_sum += 1
+
+    return {
+        "num_examples": denominator,
+        "exact_match": round_metric(safe_ratio(exact_match_sum, denominator)),
+        "token_f1": round_metric(safe_ratio(token_f1_sum, denominator)),
+        "mean_jaccard": round_metric(safe_ratio(jaccard_sum, denominator)),
+        "overlap_at_0_5": round_metric(safe_ratio(overlap_at_50_sum, denominator)),
+    }
+
+
+def compute_found_scope_metrics(
+    rows: list[dict[str, Any]],
+    *,
+    parsed_only: bool,
+) -> dict[str, Any]:
+    denominator = 0
+    parsed_examples = 0
+    answer_present_examples = 0
+    no_answer_examples = 0
+    found_correct = 0
+    true_positive = 0
+    false_positive = 0
+    true_negative = 0
+    false_negative = 0
+    answer_present_hits = 0
+    no_answer_hits = 0
+
+    for row in rows:
+        if parsed_only and not row["parsed_json"]:
+            continue
+
+        denominator += 1
+        if row["parsed_json"]:
+            parsed_examples += 1
+
+        reference = row["reference_target"]
+        prediction = row["prediction_structured"]
+        reference_found = bool(reference["found"])
+        predicted_found = bool(prediction["found"]) if row["parsed_json"] else False
+        is_correct = row["parsed_json"] and predicted_found == reference_found
+        if is_correct:
+            found_correct += 1
+
+        if reference_found:
+            answer_present_examples += 1
+            if row["parsed_json"] and predicted_found:
+                answer_present_hits += 1
+                true_positive += 1
+            else:
+                false_negative += 1
+        else:
+            no_answer_examples += 1
+            if row["parsed_json"] and not predicted_found:
+                no_answer_hits += 1
+                true_negative += 1
+            elif row["parsed_json"] and predicted_found:
+                false_positive += 1
+
+    precision = safe_ratio(true_positive, true_positive + false_positive)
+    recall = safe_ratio(true_positive, answer_present_examples)
+    f1 = None
+    if precision is not None and recall is not None and (precision + recall) > 0:
+        f1 = (2.0 * precision * recall) / (precision + recall)
+
+    return {
+        "num_examples": denominator,
+        "num_parsed_examples": parsed_examples,
+        "answer_present_examples": answer_present_examples,
+        "no_answer_examples": no_answer_examples,
+        "accuracy": round_metric(safe_ratio(found_correct, denominator)),
+        "precision": round_metric(precision),
+        "recall": round_metric(recall),
+        "f1": round_metric(f1),
+        "answer_present_recall": round_metric(safe_ratio(answer_present_hits, answer_present_examples)),
+        "no_answer_accuracy": round_metric(safe_ratio(no_answer_hits, no_answer_examples)),
+        "confusion_counts": {
+            "true_positive": true_positive,
+            "false_positive": false_positive,
+            "true_negative": true_negative,
+            "false_negative": false_negative,
+        },
+    }
+
+
+def compute_extract_ranking_metrics(
+    prediction_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    scored_rows: list[tuple[int, float]] = []
+    for row in prediction_rows:
+        best_score = row.get("qa_best_span_score")
+        null_score = row.get("qa_null_score")
+        if not isinstance(best_score, (int, float)) or not isinstance(null_score, (int, float)):
+            continue
+        scored_rows.append((1 if row["reference_target"]["found"] else 0, float(best_score) - float(null_score)))
+
+    if not scored_rows:
+        return {
+            "available": False,
+            "reason": "Prediction rows do not include confidence scores for PR-curve metrics.",
+        }
+
+    labels = [label for label, _ in scored_rows]
+    if len(set(labels)) < 2:
+        return {
+            "available": False,
+            "reason": "PR-curve metrics require both positive and negative examples.",
+        }
+
+    from sklearn.metrics import auc, precision_recall_curve
+
+    scores = [score for _, score in scored_rows]
+    precision, recall, _ = precision_recall_curve(labels, scores)
+
+    def precision_at_recall_target(target_recall: float) -> float | None:
+        candidates = [float(p) for p, r in zip(precision, recall) if float(r) >= target_recall]
+        if not candidates:
+            return None
+        return max(candidates)
+
+    return {
+        "available": True,
+        "score_definition": "qa_best_span_score_minus_qa_null_score",
+        "aupr": round_metric(float(auc(recall, precision))),
+        "precision_at_80_recall": round_metric(precision_at_recall_target(0.8)),
+        "precision_at_90_recall": round_metric(precision_at_recall_target(0.9)),
+    }
+
+
+def build_bucket_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(rows)
+    parsed_count = sum(1 for row in rows if row["parsed_json"])
+
+    found_parsed_only = compute_found_scope_metrics(rows, parsed_only=True)
+    found_whole_set = compute_found_scope_metrics(rows, parsed_only=False)
+    normalized_parsed_only = compute_text_scope_metrics(
+        rows,
+        field_name="normalized_answer",
+        require_positive_reference=False,
+        parsed_only=True,
+    )
+    normalized_whole_set = compute_text_scope_metrics(
+        rows,
+        field_name="normalized_answer",
+        require_positive_reference=False,
+        parsed_only=False,
+    )
+    normalized_positive_parsed_only = compute_text_scope_metrics(
+        rows,
+        field_name="normalized_answer",
+        require_positive_reference=True,
+        parsed_only=True,
+    )
+    normalized_positive_whole_set = compute_text_scope_metrics(
+        rows,
+        field_name="normalized_answer",
+        require_positive_reference=True,
+        parsed_only=False,
+    )
+    evidence_parsed_only = compute_text_scope_metrics(
+        rows,
+        field_name="evidence_text",
+        require_positive_reference=False,
+        parsed_only=True,
+    )
+    evidence_whole_set = compute_text_scope_metrics(
+        rows,
+        field_name="evidence_text",
+        require_positive_reference=False,
+        parsed_only=False,
+    )
+    evidence_positive_parsed_only = compute_text_scope_metrics(
+        rows,
+        field_name="evidence_text",
+        require_positive_reference=True,
+        parsed_only=True,
+    )
+    evidence_positive_whole_set = compute_text_scope_metrics(
+        rows,
+        field_name="evidence_text",
+        require_positive_reference=True,
+        parsed_only=False,
+    )
+
+    return {
+        "num_examples": total,
+        "num_parsed_examples": parsed_count,
+        "num_invalid_json_examples": total - parsed_count,
+        "parsed_json_rate": round_metric(safe_ratio(parsed_count, total)),
+        "found_metrics": {
+            "parsed_only": found_parsed_only,
+            "whole_set": found_whole_set,
+        },
+        "normalized_answer_metrics": {
+            "parsed_only": normalized_parsed_only,
+            "whole_set": normalized_whole_set,
+            "positive_only": {
+                "parsed_only": normalized_positive_parsed_only,
+                "whole_set": normalized_positive_whole_set,
+            },
+        },
+        "evidence_metrics": {
+            "parsed_only": evidence_parsed_only,
+            "whole_set": evidence_whole_set,
+            "positive_only": {
+                "parsed_only": evidence_positive_parsed_only,
+                "whole_set": evidence_positive_whole_set,
+            },
+        },
+    }
+
+
 def build_prediction_summary(prediction_rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not prediction_rows:
         return {
@@ -2093,71 +2402,301 @@ def build_prediction_summary(prediction_rows: list[dict[str, Any]]) -> dict[str,
             "normalized_answer_exact_match": None,
             "evidence_exact_match": None,
             "per_category_found_accuracy": {},
+            "found_metrics": {
+                "parsed_only": {},
+                "whole_set": {},
+            },
+            "normalized_answer_metrics": {},
+            "evidence_metrics": {},
+            "per_category_metrics": {},
+            "ranking_metrics": {
+                "available": False,
+                "reason": "No prediction rows available.",
+            },
         }
 
-    parsed_count = 0
-    found_correct = 0
-    normalized_correct = 0
-    evidence_correct = 0
-    per_category: dict[str, dict[str, int]] = {}
-
+    overall_summary = build_bucket_summary(prediction_rows)
+    per_category_rows: dict[str, list[dict[str, Any]]] = {}
     for row in prediction_rows:
-        if not row["parsed_json"]:
-            continue
-        reference = row["reference_target"]
-        prediction = row["prediction_structured"]
-        category = reference["category"]
-        parsed_count += 1
-        if prediction["found"] == reference["found"]:
-            found_correct += 1
-        if normalize_metric_text(prediction["normalized_answer"]) == normalize_metric_text(
-            reference["normalized_answer"]
-        ):
-            normalized_correct += 1
-        if normalize_metric_text(prediction["evidence_text"]) == normalize_metric_text(
-            reference["evidence_text"]
-        ):
-            evidence_correct += 1
+        category = row["reference_target"]["category"]
+        per_category_rows.setdefault(category, []).append(row)
 
-        category_summary = per_category.setdefault(
-            category,
-            {"num_examples": 0, "found_correct": 0},
-        )
-        category_summary["num_examples"] += 1
-        if prediction["found"] == reference["found"]:
-            category_summary["found_correct"] += 1
-
-    per_category_accuracy = {
-        category: round(
-            counts["found_correct"] / counts["num_examples"],
-            4,
-        )
-        for category, counts in sorted(per_category.items())
-    }
-    total = len(prediction_rows)
-    if parsed_count == 0:
-        return {
-            "num_examples": total,
-            "num_parsed_examples": 0,
-            "num_invalid_json_examples": total,
-            "parsed_json_rate": 0.0,
-            "structured_metrics_scope": "parsed_examples_only",
-            "found_accuracy": None,
-            "normalized_answer_exact_match": None,
-            "evidence_exact_match": None,
-            "per_category_found_accuracy": {},
+    per_category_metrics = {}
+    per_category_found_accuracy = {}
+    for category, category_rows in sorted(per_category_rows.items()):
+        category_summary = build_bucket_summary(category_rows)
+        found_accuracy = category_summary["found_metrics"]["parsed_only"].get("accuracy")
+        per_category_found_accuracy[category] = found_accuracy
+        per_category_metrics[category] = {
+            "num_examples": category_summary["num_examples"],
+            "num_parsed_examples": category_summary["num_parsed_examples"],
+            "num_invalid_json_examples": category_summary["num_invalid_json_examples"],
+            "parsed_json_rate": category_summary["parsed_json_rate"],
+            "found_accuracy_parsed_only": found_accuracy,
+            "found_accuracy_whole_set": category_summary["found_metrics"]["whole_set"].get("accuracy"),
+            "answer_present_recall_whole_set": category_summary["found_metrics"]["whole_set"].get(
+                "answer_present_recall"
+            ),
+            "no_answer_accuracy_whole_set": category_summary["found_metrics"]["whole_set"].get(
+                "no_answer_accuracy"
+            ),
+            "normalized_answer_exact_match_whole_set": category_summary["normalized_answer_metrics"][
+                "whole_set"
+            ].get("exact_match"),
+            "normalized_answer_token_f1_whole_set": category_summary["normalized_answer_metrics"][
+                "whole_set"
+            ].get("token_f1"),
+            "evidence_exact_match_whole_set": category_summary["evidence_metrics"]["whole_set"].get(
+                "exact_match"
+            ),
+            "evidence_token_f1_whole_set": category_summary["evidence_metrics"]["whole_set"].get(
+                "token_f1"
+            ),
+            "evidence_overlap_at_0_5_whole_set": category_summary["evidence_metrics"]["positive_only"][
+                "whole_set"
+            ].get("overlap_at_0_5"),
         }
+
     return {
-        "num_examples": total,
-        "num_parsed_examples": parsed_count,
-        "num_invalid_json_examples": total - parsed_count,
-        "parsed_json_rate": round(parsed_count / total, 4),
+        "num_examples": overall_summary["num_examples"],
+        "num_parsed_examples": overall_summary["num_parsed_examples"],
+        "num_invalid_json_examples": overall_summary["num_invalid_json_examples"],
+        "parsed_json_rate": overall_summary["parsed_json_rate"],
         "structured_metrics_scope": "parsed_examples_only",
-        "found_accuracy": round(found_correct / parsed_count, 4),
-        "normalized_answer_exact_match": round(normalized_correct / parsed_count, 4),
-        "evidence_exact_match": round(evidence_correct / parsed_count, 4),
-        "per_category_found_accuracy": per_category_accuracy,
+        "whole_set_metric_rule": (
+            "Whole-set metrics count malformed or invalid-JSON predictions as incorrect."
+        ),
+        "found_accuracy": overall_summary["found_metrics"]["parsed_only"].get("accuracy"),
+        "normalized_answer_exact_match": overall_summary["normalized_answer_metrics"]["parsed_only"].get(
+            "exact_match"
+        ),
+        "evidence_exact_match": overall_summary["evidence_metrics"]["parsed_only"].get("exact_match"),
+        "per_category_found_accuracy": per_category_found_accuracy,
+        "found_metrics": overall_summary["found_metrics"],
+        "normalized_answer_metrics": overall_summary["normalized_answer_metrics"],
+        "evidence_metrics": overall_summary["evidence_metrics"],
+        "per_category_metrics": per_category_metrics,
+        "ranking_metrics": compute_extract_ranking_metrics(prediction_rows),
     }
+
+
+def get_nested_value(payload: dict[str, Any], path: list[str], default: Any = None) -> Any:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def build_method_report(label: str, summary: dict[str, Any]) -> dict[str, Any]:
+    metrics = summary.get("metrics", {})
+    return {
+        "label": label,
+        "parsed_json_rate": metrics.get("parsed_json_rate"),
+        "num_invalid_json_examples": metrics.get("num_invalid_json_examples"),
+        "found_accuracy_whole_set": get_nested_value(
+            metrics,
+            ["found_metrics", "whole_set", "accuracy"],
+        ),
+        "answer_present_recall_whole_set": get_nested_value(
+            metrics,
+            ["found_metrics", "whole_set", "answer_present_recall"],
+        ),
+        "no_answer_accuracy_whole_set": get_nested_value(
+            metrics,
+            ["found_metrics", "whole_set", "no_answer_accuracy"],
+        ),
+        "normalized_answer_exact_match_whole_set": get_nested_value(
+            metrics,
+            ["normalized_answer_metrics", "whole_set", "exact_match"],
+        ),
+        "normalized_answer_token_f1_whole_set": get_nested_value(
+            metrics,
+            ["normalized_answer_metrics", "whole_set", "token_f1"],
+        ),
+        "evidence_exact_match_whole_set": get_nested_value(
+            metrics,
+            ["evidence_metrics", "whole_set", "exact_match"],
+        ),
+        "evidence_token_f1_whole_set": get_nested_value(
+            metrics,
+            ["evidence_metrics", "whole_set", "token_f1"],
+        ),
+        "ranking_metrics": metrics.get("ranking_metrics", {}),
+        "per_category_metrics": metrics.get("per_category_metrics", {}),
+    }
+
+
+def validate_score_prediction_inputs(
+    prediction_path: Path,
+    prediction_rows: list[dict[str, Any]],
+    metadata_summary: dict[str, Any],
+) -> None:
+    expected_prediction_artifact = metadata_summary.get("prediction_artifact")
+    if isinstance(expected_prediction_artifact, str):
+        expected_name = Path(expected_prediction_artifact).name
+        if expected_name and expected_name != prediction_path.name:
+            raise ValueError(
+                "Metadata summary refers to a different prediction artifact. "
+                f"Expected {expected_name}, received {prediction_path.name}."
+            )
+
+    expected_num_examples = get_nested_value(metadata_summary, ["metrics", "num_examples"])
+    if isinstance(expected_num_examples, int) and expected_num_examples != len(prediction_rows):
+        raise ValueError(
+            "Metadata summary example count does not match the prediction artifact. "
+            f"Expected {expected_num_examples}, received {len(prediction_rows)}."
+        )
+
+
+def write_method_comparison_charts(
+    method_reports: list[dict[str, Any]],
+    artifact_root: Path,
+    output_prefix: str,
+) -> dict[str, str]:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    chart_paths: dict[str, str] = {}
+    labels = [report["label"] for report in method_reports]
+    colors = ["#2455A6", "#D17C20", "#6A8F3A"]
+
+    overall_metrics = [
+        ("parsed_json_rate", "Parse Rate"),
+        ("found_accuracy_whole_set", "Found Acc."),
+        ("answer_present_recall_whole_set", "Answer Recall"),
+        ("no_answer_accuracy_whole_set", "No-Answer Acc."),
+        ("normalized_answer_token_f1_whole_set", "Norm. Ans. F1 (Whole Set)"),
+        ("evidence_token_f1_whole_set", "Evidence F1 (Whole Set)"),
+    ]
+    x_positions = np.arange(len(overall_metrics))
+    width = 0.22
+    figure, axis = plt.subplots(figsize=(11, 5.5))
+    for index, report in enumerate(method_reports):
+        values = [report.get(metric_key) or 0.0 for metric_key, _ in overall_metrics]
+        axis.bar(
+            x_positions + ((index - 1) * width),
+            values,
+            width=width,
+            label=report["label"],
+            color=colors[index % len(colors)],
+            alpha=0.9,
+        )
+    axis.set_xticks(x_positions)
+    axis.set_xticklabels([label for _, label in overall_metrics], rotation=20, ha="right")
+    axis.set_ylim(0.0, 1.05)
+    axis.set_ylabel("Whole-Set Score")
+    axis.set_title("Overall Whole-Set Metric Comparison (Includes No-Answer Cases)")
+    axis.grid(True, axis="y", alpha=0.25)
+    axis.legend()
+    figure.tight_layout()
+    overall_path = artifact_root / f"{output_prefix}_overall_method_metrics.png"
+    figure.savefig(overall_path, dpi=150)
+    plt.close(figure)
+    chart_paths["overall_method_metrics"] = str(overall_path)
+
+    figure, axes = plt.subplots(1, 2, figsize=(10.5, 4.5))
+    parse_rates = [report.get("parsed_json_rate") or 0.0 for report in method_reports]
+    invalid_counts = [report.get("num_invalid_json_examples") or 0 for report in method_reports]
+    axes[0].bar(labels, parse_rates, color=colors[: len(method_reports)])
+    axes[0].set_ylim(0.0, 1.05)
+    axes[0].set_title("Parse Rate")
+    axes[0].grid(True, axis="y", alpha=0.25)
+    axes[1].bar(labels, invalid_counts, color=colors[: len(method_reports)])
+    axes[1].set_title("Invalid JSON Examples")
+    axes[1].grid(True, axis="y", alpha=0.25)
+    figure.tight_layout()
+    parse_path = artifact_root / f"{output_prefix}_parse_and_invalid_json.png"
+    figure.savefig(parse_path, dpi=150)
+    plt.close(figure)
+    chart_paths["parse_and_invalid_json"] = str(parse_path)
+
+    breakdown_metrics = [
+        ("answer_present_recall_whole_set", "Answer-Present Recall"),
+        ("no_answer_accuracy_whole_set", "No-Answer Accuracy"),
+    ]
+    x_positions = np.arange(len(breakdown_metrics))
+    figure, axis = plt.subplots(figsize=(8.5, 5))
+    for index, report in enumerate(method_reports):
+        values = [report.get(metric_key) or 0.0 for metric_key, _ in breakdown_metrics]
+        axis.bar(
+            x_positions + ((index - 1) * width),
+            values,
+            width=width,
+            label=report["label"],
+            color=colors[index % len(colors)],
+            alpha=0.9,
+        )
+    axis.set_xticks(x_positions)
+    axis.set_xticklabels([label for _, label in breakdown_metrics], rotation=18, ha="right")
+    axis.set_ylim(0.0, 1.05)
+    axis.set_ylabel("Score")
+    axis.set_title("Found / Not-Found Breakdown")
+    axis.grid(True, axis="y", alpha=0.25)
+    axis.legend()
+    figure.tight_layout()
+    breakdown_path = artifact_root / f"{output_prefix}_found_breakdown.png"
+    figure.savefig(breakdown_path, dpi=150)
+    plt.close(figure)
+    chart_paths["found_breakdown"] = str(breakdown_path)
+
+    all_categories = sorted(
+        {
+            category
+            for report in method_reports
+            for category in report.get("per_category_metrics", {}).keys()
+        }
+    )
+    if all_categories:
+        primary_categories = method_reports[0].get("per_category_metrics", {})
+        sorted_categories = sorted(
+            all_categories,
+            key=lambda category: (
+                primary_categories.get(category, {}).get("found_accuracy_whole_set") or 0.0,
+                category,
+            ),
+            reverse=True,
+        )
+        y_positions = np.arange(len(sorted_categories))
+        bar_height = 0.22
+        figure_height = max(10.0, len(sorted_categories) * 0.32)
+        figure, axis = plt.subplots(figsize=(12, figure_height))
+        for index, report in enumerate(method_reports):
+            values = [
+                (
+                    report.get("per_category_metrics", {})
+                    .get(category, {})
+                    .get("found_accuracy_whole_set")
+                    or 0.0
+                )
+                for category in sorted_categories
+            ]
+            axis.barh(
+                y_positions + ((index - 1) * bar_height),
+                values,
+                height=bar_height,
+                label=report["label"],
+                color=colors[index % len(colors)],
+                alpha=0.9,
+            )
+        axis.set_yticks(y_positions)
+        axis.set_yticklabels(sorted_categories, fontsize=8)
+        axis.set_xlim(0.0, 1.05)
+        axis.set_xlabel("Whole-Set Found Accuracy")
+        axis.set_title("Per-Category Found Accuracy Comparison")
+        axis.grid(True, axis="x", alpha=0.25)
+        axis.legend(loc="lower right")
+        figure.tight_layout()
+        category_path = artifact_root / f"{output_prefix}_per_category_found_accuracy.png"
+        figure.savefig(category_path, dpi=150)
+        plt.close(figure)
+        chart_paths["per_category_found_accuracy"] = str(category_path)
+
+    return chart_paths
 
 
 def add_shared_paths(parser: argparse.ArgumentParser) -> None:
@@ -2821,6 +3360,80 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate_extractive_parser.set_defaults(func=run_evaluate_extractive)
 
+    score_predictions_parser = subparsers.add_parser(
+        "score-predictions",
+        help="Recompute richer metrics from an existing prediction JSONL artifact.",
+    )
+    add_shared_paths(score_predictions_parser)
+    score_predictions_parser.add_argument(
+        "--prediction-path",
+        required=True,
+        help="Path to an existing prediction JSONL artifact.",
+    )
+    score_predictions_parser.add_argument(
+        "--metadata-path",
+        default=None,
+        help="Optional existing metrics JSON to merge non-metric metadata from before rescoring.",
+    )
+    score_predictions_parser.add_argument(
+        "--metrics-name",
+        default="cuad_rescored_metrics.json",
+        help="Output metrics filename under artifact-root.",
+    )
+    score_predictions_parser.add_argument(
+        "--method-label",
+        default=None,
+        help="Optional display label to store in the rescored summary.",
+    )
+    score_predictions_parser.add_argument(
+        "--comparison-role",
+        default=None,
+        help="Optional comparison-role override for the rescored summary.",
+    )
+    score_predictions_parser.set_defaults(func=run_score_predictions)
+
+    plot_results_parser = subparsers.add_parser(
+        "plot-results",
+        help="Generate comparison plots from richer metrics JSON artifacts.",
+    )
+    add_shared_paths(plot_results_parser)
+    plot_results_parser.add_argument(
+        "--structured-metrics-path",
+        required=True,
+        help="Metrics JSON path for the fine-tuned structured-generation run.",
+    )
+    plot_results_parser.add_argument(
+        "--extractive-metrics-path",
+        required=True,
+        help="Metrics JSON path for the extractive QA baseline.",
+    )
+    plot_results_parser.add_argument(
+        "--zero-shot-metrics-path",
+        required=True,
+        help="Metrics JSON path for the zero-shot generative baseline.",
+    )
+    plot_results_parser.add_argument(
+        "--structured-label",
+        default="Fine-tuned Structured Generation",
+        help="Display label for the fine-tuned structured-generation run.",
+    )
+    plot_results_parser.add_argument(
+        "--extractive-label",
+        default="Extractive QA Baseline",
+        help="Display label for the extractive QA baseline.",
+    )
+    plot_results_parser.add_argument(
+        "--zero-shot-label",
+        default="Zero-Shot Generative Baseline",
+        help="Display label for the zero-shot baseline.",
+    )
+    plot_results_parser.add_argument(
+        "--output-prefix",
+        default="cuad_results_comparison",
+        help="Prefix for the generated comparison PNG and summary artifacts under artifact-root.",
+    )
+    plot_results_parser.set_defaults(func=run_plot_results)
+
     return parser
 
 
@@ -3452,7 +4065,8 @@ def run_evaluate_extractive(args: argparse.Namespace) -> int:
         "comparison_notes": (
             "found_accuracy is directly comparable to the structured-generation path. "
             "normalized_answer_exact_match and evidence_exact_match compare the single extracted span "
-            "against the structured-generation references."
+            "against the structured-generation references. "
+            "ranking_metrics include AUPR and precision-at-recall values when QA score margins are available."
         ),
         "metrics": build_prediction_summary(prediction_rows),
     }
@@ -3651,11 +4265,84 @@ def run_evaluate(args: argparse.Namespace) -> int:
         "num_sample_predictions": min(len(prediction_rows), max(0, args.num_sample_predictions)),
         "metrics_artifact": str(metrics_path),
         "evaluation_runtime_seconds": round(time.monotonic() - evaluation_started_at, 4),
+        "comparison_notes": (
+            "Top-level found_accuracy and exact-match fields remain parsed-only for backward compatibility. "
+            "Use found_metrics.whole_set and the text *_metrics.whole_set sections for final reporting "
+            "when malformed JSON should count as incorrect."
+        ),
         "metrics": build_prediction_summary(prediction_rows),
     }
     write_json(summary, metrics_path)
     print("Evaluation complete.")
     print(json.dumps(summary, indent=2))
+    return 0
+
+
+def run_score_predictions(args: argparse.Namespace) -> int:
+    roots = resolve_roots(args)
+    ensure_runtime_roots(roots)
+    artifact_root = ensure_directory(Path(roots["artifact_root"]))
+    prediction_path = Path(args.prediction_path)
+    if not prediction_path.exists():
+        raise FileNotFoundError(f"Prediction artifact not found: {prediction_path}")
+
+    prediction_rows = load_jsonl(prediction_path)
+    summary: dict[str, Any]
+    if args.metadata_path:
+        metadata_path = Path(args.metadata_path)
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata summary not found: {metadata_path}")
+        summary = load_json(metadata_path)
+        validate_score_prediction_inputs(prediction_path, prediction_rows, summary)
+    else:
+        summary = {}
+
+    output_path = artifact_root / args.metrics_name
+    summary["prediction_artifact"] = str(prediction_path)
+    summary["metrics_artifact"] = str(output_path)
+    summary["scored_from_prediction_artifact"] = str(prediction_path)
+    if args.method_label:
+        summary["method_label"] = args.method_label
+    if args.comparison_role:
+        summary["comparison_role"] = args.comparison_role
+    summary["metrics"] = build_prediction_summary(prediction_rows)
+    write_json(summary, output_path)
+    print("Prediction scoring complete.")
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def run_plot_results(args: argparse.Namespace) -> int:
+    roots = resolve_roots(args)
+    ensure_runtime_roots(roots)
+    artifact_root = ensure_directory(Path(roots["artifact_root"]))
+
+    structured_summary = load_json(Path(args.structured_metrics_path))
+    extractive_summary = load_json(Path(args.extractive_metrics_path))
+    zero_shot_summary = load_json(Path(args.zero_shot_metrics_path))
+
+    method_reports = [
+        build_method_report(args.structured_label, structured_summary),
+        build_method_report(args.extractive_label, extractive_summary),
+        build_method_report(args.zero_shot_label, zero_shot_summary),
+    ]
+    chart_paths = write_method_comparison_charts(
+        method_reports=method_reports,
+        artifact_root=artifact_root,
+        output_prefix=args.output_prefix,
+    )
+
+    comparison_summary = {
+        "structured_metrics_path": str(Path(args.structured_metrics_path)),
+        "extractive_metrics_path": str(Path(args.extractive_metrics_path)),
+        "zero_shot_metrics_path": str(Path(args.zero_shot_metrics_path)),
+        "method_reports": method_reports,
+        "visualization_artifacts": chart_paths,
+    }
+    summary_path = artifact_root / f"{args.output_prefix}_summary.json"
+    write_json(comparison_summary, summary_path)
+    print("Result visualization complete.")
+    print(json.dumps(comparison_summary, indent=2))
     return 0
 
 
